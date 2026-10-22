@@ -1357,6 +1357,25 @@ static void kw_route_audio_to_kodi(void)
     g_message("audio: pages play through Kodi at %s", path);
 }
 
+/* The engine binds and loads the CDM named by WPE_WIDEVINE_CDM_PATH. */
+static void kw_offer_widevine(void)
+{
+    const char *dir = g_getenv("KODI_WEB_CDM_DIR");
+    char *path;
+
+    if (!dir || g_getenv("WPE_WIDEVINE_CDM_PATH"))
+        return;
+
+    path = g_build_filename(dir, "libwidevinecdm.so", NULL);
+    if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) {
+        g_setenv("WPE_WIDEVINE_CDM_PATH", path, TRUE);
+        g_message("drm: pages decrypt with %s", path);
+    } else {
+        g_message("drm: no Widevine CDM in %s", dir);
+    }
+    g_free(path);
+}
+
 int main(int argc, char *argv[])
 {
     (void)argc;
@@ -1366,6 +1385,7 @@ int main(int argc, char *argv[])
      * pipeline (and the child processes that run it) start. */
     kw_apply_codec_policy();
     kw_route_audio_to_kodi();
+    kw_offer_widevine();
 
     /* Reap throwaway default stores left by a previous run before we start. */
     reap_stale_default_stores();
