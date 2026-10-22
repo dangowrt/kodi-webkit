@@ -1376,6 +1376,49 @@ static void kw_offer_widevine(void)
     g_free(path);
 }
 
+#ifndef KW_WIDEVINE_PRELOAD
+#define KW_WIDEVINE_PRELOAD ""
+#endif
+
+static void kw_preload_drop(const char *library)
+{
+    const char *preload = g_getenv("LD_PRELOAD");
+    GString *kept;
+    char **entries;
+    int i;
+
+    if (!preload)
+        return;
+
+    entries = g_strsplit_set(preload, " :", -1);
+    kept = g_string_new(NULL);
+    for (i = 0; entries[i]; i++) {
+        if (!*entries[i] || !strcmp(entries[i], library))
+            continue;
+        if (kept->len)
+            g_string_append_c(kept, ':');
+        g_string_append(kept, entries[i]);
+    }
+    if (kept->len)
+        g_setenv("LD_PRELOAD", kept->str, TRUE);
+    else
+        g_unsetenv("LD_PRELOAD");
+    g_string_free(kept, TRUE);
+    g_strfreev(entries);
+}
+
+/* Kodi starts with the library its own CDM loader needs; of our children
+ * only the web process loads the CDM, and the engine preloads it there. */
+static void kw_preload_for_widevine(void)
+{
+    if (!*KW_WIDEVINE_PRELOAD)
+        return;
+
+    kw_preload_drop(KW_WIDEVINE_PRELOAD);
+    if (g_getenv("WPE_WIDEVINE_CDM_PATH"))
+        g_setenv("WPE_WIDEVINE_CDM_PRELOAD", KW_WIDEVINE_PRELOAD, FALSE);
+}
+
 int main(int argc, char *argv[])
 {
     (void)argc;
@@ -1386,6 +1429,7 @@ int main(int argc, char *argv[])
     kw_apply_codec_policy();
     kw_route_audio_to_kodi();
     kw_offer_widevine();
+    kw_preload_for_widevine();
 
     /* Reap throwaway default stores left by a previous run before we start. */
     reap_stale_default_stores();
