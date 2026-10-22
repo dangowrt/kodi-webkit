@@ -45,6 +45,7 @@
 #include <wpe/wayland/wpe-wayland.h>
 
 #include "kodi-web-v1-client-protocol.h"
+#include "protocol/kodi-web-audio.h"
 
 /* Fixed, greppable prefix for the ephemeral default view's throwaway content
  * filter store under g_get_tmp_dir(); used both to create and to reap it. */
@@ -1328,6 +1329,34 @@ static gboolean quit_on_signal(gpointer app)
     return G_SOURCE_REMOVE;
 }
 
+/* Above every system audio sink, pulsesink being PRIMARY + 10. */
+#define KW_AUDIO_SINK_RANK (GST_RANK_PRIMARY + 100)
+
+static void kw_route_audio_to_kodi(void)
+{
+    const char *path = g_getenv(KODI_WEB_AUDIO_ENV);
+    const char *existing;
+    char *rank;
+
+    if (!path || !g_file_test(path, G_FILE_TEST_EXISTS)) {
+        g_message("audio: no Kodi audio socket, pages use the system audio sink");
+        return;
+    }
+
+    webkit_web_context_add_path_to_sandbox(webkit_web_context_get_default(),
+        path, FALSE);
+
+    existing = g_getenv("GST_PLUGIN_FEATURE_RANK");
+    if (existing && *existing)
+        rank = g_strdup_printf("%s,kodiaudiosink:%d", existing, KW_AUDIO_SINK_RANK);
+    else
+        rank = g_strdup_printf("kodiaudiosink:%d", KW_AUDIO_SINK_RANK);
+    g_setenv("GST_PLUGIN_FEATURE_RANK", rank, TRUE);
+    g_free(rank);
+
+    g_message("audio: pages play through Kodi at %s", path);
+}
+
 int main(int argc, char *argv[])
 {
     (void)argc;
@@ -1336,6 +1365,7 @@ int main(int argc, char *argv[])
     /* Decoder-rank policy must be in place before the engine's media
      * pipeline (and the child processes that run it) start. */
     kw_apply_codec_policy();
+    kw_route_audio_to_kodi();
 
     /* Reap throwaway default stores left by a previous run before we start. */
     reap_stale_default_stores();
