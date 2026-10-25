@@ -95,7 +95,26 @@ typedef struct {
     gboolean active;
     gboolean crash_recovering;      /* set on crash, cleared on next load     */
     gboolean reload_started;        /* recovery reload has begun loading      */
+    gboolean hbbtv_keys;            /* KeyEvent constants added to the pages  */
 } KWView;
+
+/* HbbTV apps learn the remote's key codes from KeyEvent.VK_*: WPE's codes */
+static const char HBBTV_KEY_EVENT_SCRIPT[] =
+    "(function () {\n"
+    "  var k = window.KeyEvent || (window.KeyEvent = {});\n"
+    "  var codes = {\n"
+    "    VK_LEFT: 37, VK_UP: 38, VK_RIGHT: 39, VK_DOWN: 40, VK_ENTER: 13,\n"
+    "    VK_BACK: 166, VK_RED: 403, VK_GREEN: 404, VK_YELLOW: 405,\n"
+    "    VK_BLUE: 406, VK_PLAY: 250, VK_PAUSE: 19, VK_PLAY_PAUSE: 250,\n"
+    "    VK_STOP: 178, VK_FAST_FWD: 228, VK_REWIND: 227, VK_NEXT: 176,\n"
+    "    VK_PREV: 177, VK_RECORD: 416, VK_0: 48, VK_1: 49, VK_2: 50,\n"
+    "    VK_3: 51, VK_4: 52, VK_5: 53, VK_6: 54, VK_7: 55, VK_8: 56,\n"
+    "    VK_9: 57\n"
+    "  };\n"
+    "  for (var name in codes)\n"
+    "    if (k[name] === undefined)\n"
+    "      k[name] = codes[name];\n"
+    "})();\n";
 
 static void kw_flush(void)
 {
@@ -749,6 +768,17 @@ static gboolean read_fd_exactly(int fd, uint32_t size, char **out, gsize *out_le
     return TRUE;
 }
 
+static void view_add_hbbtv_keys(KWView *v)
+{
+    WebKitUserScript *script = webkit_user_script_new(HBBTV_KEY_EVENT_SCRIPT,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        NULL, NULL);
+    webkit_user_content_manager_add_script(v->ucm, script);
+    webkit_user_script_unref(script);
+    v->hbbtv_keys = TRUE;
+}
+
 static void view_set_user_agent(void *data, struct kodi_web_view_v1 *proxy,
     const char *user_agent)
 {
@@ -766,6 +796,8 @@ static void view_set_user_agent(void *data, struct kodi_web_view_v1 *proxy,
         return;
     }
     webkit_settings_set_user_agent(v->settings, user_agent);
+    if (!v->hbbtv_keys && strstr(user_agent, "HbbTV/"))
+        view_add_hbbtv_keys(v);
 }
 
 static void view_add_user_script(void *data, struct kodi_web_view_v1 *proxy,
