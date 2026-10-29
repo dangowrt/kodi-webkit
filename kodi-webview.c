@@ -1451,12 +1451,9 @@ static void kw_preload_for_widevine(void)
         g_setenv("WPE_WIDEVINE_CDM_PRELOAD", KW_WIDEVINE_PRELOAD, FALSE);
 }
 
-/* The adaptivedemux2 demuxers outrank the legacy ones and only work in
- * playbin3, which the engine uses for regular playback only on request. */
 static void kw_enable_adaptive_streaming(void)
 {
     g_setenv("WEBKIT_GST_ENABLE_DASH_SUPPORT", "1", FALSE);
-    g_setenv("WEBKIT_GST_USE_PLAYBIN3", "1", FALSE);
 }
 
 int main(int argc, char *argv[])
