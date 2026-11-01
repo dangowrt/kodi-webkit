@@ -13,4 +13,11 @@ gcompat's `libgcompat-ifunc.so.0`, name it in `WIDEVINE_PRELOAD` when building:
 `WPE_WIDEVINE_CDM_PRELOAD`, and drops it from the preloads its other children
 inherit from Kodi.
 
+Where the host keeps maintained content filter lists compiled in a WebKit
+content filter store, as OpenWrt's `webkit-contentfilter` does in
+`/var/run/webkit-contentfilter`, name that directory in `CONTENT_FILTER_DIR`
+when building: a web app then opts into a list by its identifier, and
+`kodi-webview` applies it to that app's view whenever the list is published
+or updated.
+
 Licensed under the GPL-2.0-or-later (LICENSE).

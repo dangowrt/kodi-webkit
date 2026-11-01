@@ -50,7 +50,7 @@
     the protocol and interface names and resetting the interface version.
   </description>
 
-  <interface name="kodi_web_manager_v1" version="1">
+  <interface name="kodi_web_manager_v1" version="2">
     <description summary="create and announce web views">
       The global through which the browser announces itself and creates
       views. A browser binds it once.
@@ -85,8 +85,8 @@
 
         The profile names the hermetic storage this view uses. The
         compositor configures the view with set_user_agent,
-        add_user_script and add_content_filter events before its first
-        load_url, so the browser must not load anything into a fresh view
+        add_user_script, add_content_filter and add_content_filter_list
+        events before its first load_url, so the browser must not load anything into a fresh view
         on its own.
       </description>
       <arg name="id" type="new_id" interface="kodi_web_view_v1"/>
@@ -134,13 +134,13 @@
     </request>
   </interface>
 
-  <interface name="kodi_web_view_v1" version="1">
+  <interface name="kodi_web_view_v1" version="2">
     <description summary="one web view of one profile">
       A view is one page container bound to one surface. The compositor
       drives it with events and learns its state through requests.
 
       Configuration events (set_user_agent, add_user_script,
-      add_content_filter) apply to this view only and take effect from
+      add_content_filter, add_content_filter_list) apply to this view only and take effect from
       the next navigation. They arrive before the first load_url of a
       view the compositor asked for.
 
@@ -301,6 +301,18 @@
         The browser unloads the page, unmaps the surface and destroys the
         view. The profile's storage stays.
       </description>
+    </event>
+
+    <event name="add_content_filter_list" since="2">
+      <description summary="apply a system content filter list to this view">
+        A request filter the system keeps compiled for every web engine on
+        the host, named by its list identifier, such as a maintained ad or
+        tracker list. Where the browser finds those lists is its own
+        configuration. A list that is not there yet, or that is replaced
+        later, is applied to this view once it appears; a list the system
+        removes is removed from the view.
+      </description>
+      <arg name="name" type="string" summary="list identifier"/>
     </event>
   </interface>
 </protocol>

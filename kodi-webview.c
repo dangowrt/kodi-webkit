@@ -14,7 +14,8 @@
  * load_progress, navigation_state, error, destroy) are client-to-compositor
  * REQUESTS; the compositor's commands (want_view on the manager;
  * set_user_agent, add_user_script, add_content_filter, load_url, navigate,
- * set_active, close on the view) are EVENTS this client handles.
+ * set_active, close, add_content_filter_list on the view) are EVENTS this
+ * client handles.
  *
  * Wayland integration: WPE owns the wl_display. We fetch it with
  * wpe_display_wayland_get_wl_display(), create our OWN wl_registry on it to
@@ -63,6 +64,8 @@ static struct kodi_web_manager_v1 *g_manager = NULL;
 static uint32_t g_manager_name = 0;
 static GHashTable *g_views = NULL;   /* profile id (char*, verbatim) -> KWView* */
 static gboolean g_ready_sent = FALSE;
+static WebKitUserContentFilterStore *g_list_store = NULL;
+static GFileMonitor *g_list_monitor = NULL;
 
 /* ------------------------------------------------------------------ */
 /* Per-view state                                                      */
@@ -86,6 +89,7 @@ typedef struct {
 
     GCancellable *cancellable;      /* cancels pending async on close         */
     GHashTable *filter_hashes;      /* name (char*) -> sha256 hex (char*)     */
+    GHashTable *filter_lists;       /* system list identifiers (char*)        */
     char *last_favicon_hash;        /* sha256 of the last favicon sent        */
     guint favicon_retry_id;         /* repeating poll source after a load     */
     int favicon_tries;              /* icon-fetch attempts for the current load */
@@ -904,6 +908,122 @@ static void view_add_content_filter(void *data, struct kodi_web_view_v1 *proxy,
     g_bytes_unref(bytes);
 }
 
+typedef struct {
+    KWView *view;
+    char *name;
+} FilterListCtx;
+
+static void on_filter_list_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    FilterListCtx *ctx = user_data;
+    GError *error = NULL;
+    WebKitUserContentFilter *filter = webkit_user_content_filter_store_load_finish(
+        WEBKIT_USER_CONTENT_FILTER_STORE(source), res, &error);
+    if (!filter) {
+        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+            g_message("view %s: content filter list %s not loaded: %s", ctx->view->profile,
+                ctx->name, error ? error->message : "(no message)");
+        g_clear_error(&error);
+        g_free(ctx->name);
+        g_free(ctx);
+        return;
+    }
+    webkit_user_content_manager_remove_filter_by_id(ctx->view->ucm, ctx->name);
+    webkit_user_content_manager_add_filter(ctx->view->ucm, filter);
+    webkit_user_content_filter_unref(filter);
+    g_message("view %s: content filter list %s applied", ctx->view->profile, ctx->name);
+
+    g_free(ctx->name);
+    g_free(ctx);
+}
+
+static void view_filter_list_load(KWView *v, const char *name)
+{
+    FilterListCtx *ctx = g_new0(FilterListCtx, 1);
+    ctx->view = v;
+    ctx->name = g_strdup(name);
+    webkit_user_content_filter_store_load(g_list_store, name, v->cancellable,
+        on_filter_list_loaded, ctx);
+}
+
+static void view_add_content_filter_list(void *data, struct kodi_web_view_v1 *proxy,
+    const char *name)
+{
+    (void)proxy;
+    KWView *v = data;
+    if (!name || !*name)
+        return;
+    if (!g_list_store) {
+        g_warning("view %s: no content filter lists on this host, ignoring %s",
+            v->profile, name);
+        return;
+    }
+    g_hash_table_add(v->filter_lists, g_strdup(name));
+    view_filter_list_load(v, name);
+}
+
+#ifdef KW_CONTENT_FILTER_DIR
+#define KW_FILTER_LIST_PREFIX "ContentRuleList-"
+
+/* Lists are published by an atomic rename, so CREATED covers every update. */
+static void on_filter_lists_changed(GFileMonitor *monitor, GFile *file, GFile *other,
+    GFileMonitorEvent event, gpointer user_data)
+{
+    (void)monitor;
+    (void)other;
+    (void)user_data;
+    if (event != G_FILE_MONITOR_EVENT_CREATED && event != G_FILE_MONITOR_EVENT_DELETED)
+        return;
+
+    char *base = g_file_get_basename(file);
+    if (!base || !g_str_has_prefix(base, KW_FILTER_LIST_PREFIX)) {
+        g_free(base);
+        return;
+    }
+    const char *name = base + strlen(KW_FILTER_LIST_PREFIX);
+
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init(&iter, g_views);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        KWView *v = value;
+        if (!g_hash_table_contains(v->filter_lists, name))
+            continue;
+        if (event == G_FILE_MONITOR_EVENT_CREATED)
+            view_filter_list_load(v, name);
+        else
+            webkit_user_content_manager_remove_filter_by_id(v->ucm, name);
+    }
+    g_free(base);
+}
+
+static void filter_lists_watch(void)
+{
+    GError *error = NULL;
+    GFile *dir;
+
+    if (!g_file_test(KW_CONTENT_FILTER_DIR, G_FILE_TEST_IS_DIR)) {
+        g_message("no content filter lists in %s", KW_CONTENT_FILTER_DIR);
+        return;
+    }
+    dir = g_file_new_for_path(KW_CONTENT_FILTER_DIR);
+    g_list_monitor = g_file_monitor_directory(dir, G_FILE_MONITOR_NONE, NULL, &error);
+    g_object_unref(dir);
+    if (!g_list_monitor) {
+        g_warning("cannot watch %s: %s", KW_CONTENT_FILTER_DIR,
+            error ? error->message : "(no message)");
+        g_clear_error(&error);
+        return;
+    }
+    g_signal_connect(g_list_monitor, "changed", G_CALLBACK(on_filter_lists_changed), NULL);
+    g_list_store = webkit_user_content_filter_store_new(KW_CONTENT_FILTER_DIR);
+}
+#else
+static void filter_lists_watch(void)
+{
+}
+#endif
+
 static void view_load_url(void *data, struct kodi_web_view_v1 *proxy, const char *url)
 {
     (void)proxy;
@@ -965,7 +1085,8 @@ static const struct kodi_web_view_v1_listener view_listener = {
     view_load_url,
     view_navigate,
     view_set_active,
-    view_close
+    view_close,
+    view_add_content_filter_list
 };
 
 /* ------------------------------------------------------------------ */
@@ -1005,6 +1126,8 @@ static void view_free(gpointer data)
         g_object_unref(v->cancellable);
     if (v->filter_hashes)
         g_hash_table_destroy(v->filter_hashes);
+    if (v->filter_lists)
+        g_hash_table_destroy(v->filter_lists);
     if (v->tmp_dir)
         kw_rmrf(v->tmp_dir);   /* throwaway store for the ephemeral default */
     g_free(v->last_favicon_hash);
@@ -1086,6 +1209,7 @@ static KWView *view_create(const char *profile, const char *uplink, gboolean is_
     v->ephemeral = (g_strcmp0(v->profile, "default") == 0);
     v->active = TRUE;
     v->filter_hashes = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    v->filter_lists = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     v->cancellable = g_cancellable_new();
 
     char *store_dir = NULL;
@@ -1256,7 +1380,7 @@ static void registry_global(void *data, struct wl_registry *registry,
 {
     (void)data;
     if (g_strcmp0(interface, kodi_web_manager_v1_interface.name) == 0 && !g_manager) {
-        uint32_t bind_ver = version < 1 ? version : 1;
+        uint32_t bind_ver = version < 2 ? version : 2;
         g_manager = wl_registry_bind(registry, name, &kodi_web_manager_v1_interface, bind_ver);
         g_manager_name = name;
         kodi_web_manager_v1_add_listener(g_manager, &manager_listener, NULL);
@@ -1340,6 +1464,7 @@ static void activate(GApplication *application, gpointer user_data)
     }
 
     g_views = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, view_free);
+    filter_lists_watch();
 
     /* 3. Warm "default" view: create_view + about:blank; ready follows once
      * the default view's first load finishes (engine processes up). */
