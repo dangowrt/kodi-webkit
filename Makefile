@@ -8,8 +8,6 @@ GSTPLUGINDIR ?= $(LIBDIR)/gstreamer-1.0
 CFLAGS ?= -O2
 # library the web process preloads to load the Widevine CDM, if any
 WIDEVINE_PRELOAD ?=
-# content filter store the host keeps system lists compiled in, if any
-CONTENT_FILTER_DIR ?=
 
 DEPS := wpe-webkit-2.0 wayland-client gstreamer-1.0
 DEPS_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(DEPS))
@@ -29,7 +27,7 @@ all: kodi-webview kodi-webview-filter libgstkodiaudiosink.so
 
 kodi-webview: kodi-webview.c protocol/kodi-web-audio.h $(GENERATED)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPS_CFLAGS) -I. \
-		$(if $(CONTENT_FILTER_DIR),-DKW_CONTENT_FILTER_DIR='"$(CONTENT_FILTER_DIR)"') \
+		-DKW_FILTER_HELPER='"$(LIBEXECDIR)/kodi-webview-filter"' \
 		$(if $(WIDEVINE_PRELOAD),-DKW_WIDEVINE_PRELOAD='"$(WIDEVINE_PRELOAD)"') \
 		-o $@ kodi-webview.c kodi-web-v1-protocol.c $(LDFLAGS) $(DEPS_LIBS)
 

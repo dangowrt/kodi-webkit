@@ -13,11 +13,11 @@ gcompat's `libgcompat-ifunc.so.0`, name it in `WIDEVINE_PRELOAD` when building:
 `WPE_WIDEVINE_CDM_PRELOAD`, and drops it from the preloads its other children
 inherit from Kodi.
 
-Where the host keeps maintained content filter lists compiled in a WebKit
-content filter store, as OpenWrt's `webkit-contentfilter` does in
-`/var/run/webkit-contentfilter`, name that directory in `CONTENT_FILTER_DIR`
-when building: a web app then opts into a list by its identifier, and
-`kodi-webview` applies it to that app's view whenever the list is published
-or updated.
+Content filters arrive in Adblock Plus filter syntax. `kodi-webview-filter`,
+installed in `LIBEXECDIR`, converts a list to WebKit content blocker rules
+and compiles them into the store under `$XDG_DATA_HOME/kodi-webview-filters`,
+keyed by the converted rules, so that a list is compiled once and kept
+across runs. It runs as a process of its own because a large list takes
+hundreds of megabytes to compile.
 
 Licensed under the GPL-2.0-or-later (LICENSE).

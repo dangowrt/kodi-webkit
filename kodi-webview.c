@@ -11,11 +11,12 @@
  * Runtime model: Kodi spawns this binary with NO arguments, environment
  * WPE_PLATFORM=wayland and an inherited WAYLAND_SOCKET. The browser is the
  * Wayland client. View state reports (url_changed, title_changed, favicon,
- * load_progress, navigation_state, error, destroy) are client-to-compositor
- * REQUESTS; the compositor's commands (want_view on the manager;
- * set_user_agent, add_user_script, add_content_filter, load_url, navigate,
- * set_active, close, add_content_filter_list on the view) are EVENTS this
- * client handles.
+ * load_progress, navigation_state, error, exit, media_state, destroy) are
+ * client-to-compositor REQUESTS; the compositor's commands (want_view,
+ * content_filter_list, remove_content_filter_list on the manager;
+ * set_user_agent, add_user_script, add_content_filter,
+ * add_content_filter_list, load_url, navigate, set_active, close on the
+ * view) are EVENTS this client handles.
  *
  * Wayland integration: WPE owns the wl_display. We fetch it with
  * wpe_display_wayland_get_wl_display(), create our OWN wl_registry on it to
@@ -48,9 +49,13 @@
 #include "kodi-web-v1-client-protocol.h"
 #include "protocol/kodi-web-audio.h"
 
-/* Fixed, greppable prefix for the ephemeral default view's throwaway content
- * filter store under g_get_tmp_dir(); used both to create and to reap it. */
-#define KW_DEFAULT_TMP_PREFIX "kodi-webview-default-"
+#ifndef KW_FILTER_HELPER
+#define KW_FILTER_HELPER "/usr/libexec/kodi-webview-filter"
+#endif
+
+#define KW_FILTER_FILE_PREFIX "ContentRuleList-"
+#define KW_FILTER_INDEX_GROUP "filters"
+#define KW_PROFILE_MAX 255
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                             */
@@ -64,32 +69,49 @@ static struct kodi_web_manager_v1 *g_manager = NULL;
 static uint32_t g_manager_name = 0;
 static GHashTable *g_views = NULL;   /* profile id (char*, verbatim) -> KWView* */
 static gboolean g_ready_sent = FALSE;
-static WebKitUserContentFilterStore *g_list_store = NULL;
-static GFileMonitor *g_list_monitor = NULL;
+static guint g_view_serial = 0;
+
+static WebKitUserContentFilterStore *g_filter_store = NULL;
+static char *g_filter_dir = NULL;
+static GKeyFile *g_filter_index = NULL;
+static char *g_filter_index_path = NULL;
+static GHashTable *g_lists = NULL;
+static GHashTable *g_lists_cached = NULL;
+static GHashTable *g_list_gen = NULL;
+static GQueue g_filter_jobs = G_QUEUE_INIT;
+static gboolean g_filter_busy = FALSE;
 
 /* ------------------------------------------------------------------ */
 /* Per-view state                                                      */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    char *profile;                  /* verbatim protocol id (may carry dots) */
-    char *dir;                      /* filesystem-safe directory name        */
+    char *profile;
+    guint serial;
     gboolean is_default;            /* the warm default view                 */
     gboolean ephemeral;             /* profile "default": no on-disk state    */
-    char *tmp_dir;                  /* throwaway dir for ephemeral filter store */
 
     WebKitNetworkSession *session;
     WebKitSettings *settings;
     WebKitUserContentManager *ucm;
-    WebKitUserContentFilterStore *filter_store;
     WebKitFaviconDatabase *favicon_db;
     WebKitWebView *web_view;
 
     struct kodi_web_view_v1 *proxy;
 
     GCancellable *cancellable;      /* cancels pending async on close         */
-    GHashTable *filter_hashes;      /* name (char*) -> sha256 hex (char*)     */
-    GHashTable *filter_lists;       /* system list identifiers (char*)        */
+    GHashTable *filters;
+    GHashTable *filter_gen;
+    GHashTable *filter_lists;
+    guint pending;
+    char *pending_url;
+    gboolean config_failed;
+    gboolean loading;
+    char *failed_uri;
+    gboolean exit_sent;
+    GHashTable *media_frames;
+    gboolean playing_audio;
+    guint media_sent;
     char *last_favicon_hash;        /* sha256 of the last favicon sent        */
     guint favicon_retry_id;         /* repeating poll source after a load     */
     int favicon_tries;              /* icon-fetch attempts for the current load */
@@ -99,25 +121,58 @@ typedef struct {
     gboolean active;
     gboolean crash_recovering;      /* set on crash, cleared on next load     */
     gboolean reload_started;        /* recovery reload has begun loading      */
-    gboolean hbbtv_keys;            /* KeyEvent constants added to the pages  */
 } KWView;
 
-/* HbbTV apps learn the remote's key codes from KeyEvent.VK_*: WPE's codes */
-static const char HBBTV_KEY_EVENT_SCRIPT[] =
+#define KW_MEDIA_VIDEO   (1u << 0)
+#define KW_MEDIA_AUDIO   (1u << 1)
+#define KW_MEDIA_PLAYING (1u << 2)
+#define KW_MEDIA_SENT    (1u << 3)
+
+/* window.close() of the top document asks Kodi to leave the app */
+static const char EXIT_SCRIPT[] =
     "(function () {\n"
-    "  var k = window.KeyEvent || (window.KeyEvent = {});\n"
-    "  var codes = {\n"
-    "    VK_LEFT: 37, VK_UP: 38, VK_RIGHT: 39, VK_DOWN: 40, VK_ENTER: 13,\n"
-    "    VK_BACK: 166, VK_RED: 403, VK_GREEN: 404, VK_YELLOW: 405,\n"
-    "    VK_BLUE: 406, VK_PLAY: 250, VK_PAUSE: 19, VK_PLAY_PAUSE: 250,\n"
-    "    VK_STOP: 178, VK_FAST_FWD: 228, VK_REWIND: 227, VK_NEXT: 176,\n"
-    "    VK_PREV: 177, VK_RECORD: 416, VK_0: 48, VK_1: 49, VK_2: 50,\n"
-    "    VK_3: 51, VK_4: 52, VK_5: 53, VK_6: 54, VK_7: 55, VK_8: 56,\n"
-    "    VK_9: 57\n"
-    "  };\n"
-    "  for (var name in codes)\n"
-    "    if (k[name] === undefined)\n"
-    "      k[name] = codes[name];\n"
+    "  var kodi = window.webkit.messageHandlers.kodi;\n"
+    "  window.close = function () { kodi.postMessage('exit'); };\n"
+    "})();\n";
+
+#define KW_MEDIA_WORLD "kodi-media"
+
+/* runs in its own world: pages can neither see nor post to its handler */
+static const char MEDIA_SCRIPT[] =
+    "(function () {\n"
+    "  var post = window.webkit.messageHandlers.kodimedia;\n"
+    "  var token = Math.random().toString(36).slice(2) + Date.now().toString(36);\n"
+    "  var media = new Set();\n"
+    "  var last = -1;\n"
+    "  function bits(m) {\n"
+    "    var s = 0;\n"
+    "    if (m.networkState === m.NETWORK_EMPTY || m.error)\n"
+    "      return 0;\n"
+    "    if (m instanceof HTMLVideoElement && m.videoWidth > 0)\n"
+    "      s |= 1;\n"
+    "    if ((m.audioTracks && m.audioTracks.length) || m.webkitAudioDecodedByteCount > 0)\n"
+    "      s |= 2;\n"
+    "    if (!m.paused && !m.ended)\n"
+    "      s |= 4;\n"
+    "    return s;\n"
+    "  }\n"
+    "  function update(e) {\n"
+    "    var s = 0;\n"
+    "    if (e.target instanceof HTMLMediaElement)\n"
+    "      media.add(e.target);\n"
+    "    media.forEach(function (m) { s |= bits(m); });\n"
+    "    if (s === last)\n"
+    "      return;\n"
+    "    last = s;\n"
+    "    post.postMessage(token + ':' + s);\n"
+    "  }\n"
+    "  ['play', 'playing', 'pause', 'ended', 'emptied', 'error', 'loadedmetadata',\n"
+    "   'loadeddata', 'timeupdate'].forEach(function (t) {\n"
+    "    document.addEventListener(t, update, true);\n"
+    "  });\n"
+    "  window.addEventListener('pagehide', function () {\n"
+    "    post.postMessage(token + ':gone');\n"
+    "  }, true);\n"
     "})();\n";
 
 static void kw_flush(void)
@@ -528,15 +583,122 @@ static void favicon_start_poll(KWView *v)
 /* WebKit signals -> protocol requests                                 */
 /* ------------------------------------------------------------------ */
 
-static void on_notify_uri(WebKitWebView *view, GParamSpec *pspec, gpointer user_data)
+static void url_report(KWView *v, const char *uri)
 {
-    (void)pspec;
-    KWView *v = user_data;
-    const char *uri = webkit_web_view_get_uri(view);
     g_free(v->current_url);
     v->current_url = g_strdup(uri ? uri : "");
-    kodi_web_view_v1_url_changed(v->proxy, uri ? uri : "");
+    kodi_web_view_v1_url_changed(v->proxy, v->current_url);
     kw_flush();
+}
+
+static void on_notify_uri(WebKitWebView *view, GParamSpec *pspec, gpointer user_data)
+{
+    KWView *v = user_data;
+
+    (void)pspec;
+    if (v->loading)
+        return;
+    url_report(v, webkit_web_view_get_uri(view));
+}
+
+static void media_state_send(KWView *v, gboolean force)
+{
+    gboolean playing = v->playing_audio;
+    GHashTableIter it;
+    guint bits = 0;
+    gpointer value;
+
+    if (v->playing_audio)
+        bits |= KW_MEDIA_AUDIO;
+    g_hash_table_iter_init(&it, v->media_frames);
+    while (g_hash_table_iter_next(&it, NULL, &value)) {
+        bits |= GPOINTER_TO_UINT(value) & (KW_MEDIA_VIDEO | KW_MEDIA_AUDIO);
+        playing |= (GPOINTER_TO_UINT(value) & KW_MEDIA_PLAYING) != 0;
+    }
+    if (playing)
+        bits |= KW_MEDIA_PLAYING;
+
+    if (!force && (v->media_sent & KW_MEDIA_SENT) && (v->media_sent & ~KW_MEDIA_SENT) == bits)
+        return;
+    v->media_sent = bits | KW_MEDIA_SENT;
+    if (!v->proxy)
+        return;
+    kodi_web_view_v1_media_state(v->proxy, !!(bits & KW_MEDIA_VIDEO), !!(bits & KW_MEDIA_AUDIO),
+                                 !(bits & KW_MEDIA_PLAYING));
+    kw_flush();
+}
+
+static void media_reset(KWView *v)
+{
+    g_hash_table_remove_all(v->media_frames);
+    v->playing_audio = v->web_view && webkit_web_view_is_playing_audio(v->web_view);
+    media_state_send(v, TRUE);
+}
+
+static void on_notify_playing_audio(WebKitWebView *view, GParamSpec *pspec, gpointer user_data)
+{
+    KWView *v = user_data;
+
+    (void)pspec;
+    v->playing_audio = webkit_web_view_is_playing_audio(view);
+    media_state_send(v, FALSE);
+}
+
+static void on_media_message(WebKitUserContentManager *ucm, JSCValue *value, gpointer user_data)
+{
+    KWView *v = user_data;
+    char *message;
+    guint64 bits;
+    char *state;
+
+    (void)ucm;
+    if (!jsc_value_is_string(value))
+        return;
+    message = jsc_value_to_string(value);
+    state = strrchr(message, ':');
+    if (!state || state == message) {
+        g_free(message);
+        return;
+    }
+    *state++ = '\0';
+
+    if (!strcmp(state, "gone"))
+        g_hash_table_remove(v->media_frames, message);
+    else if (g_ascii_string_to_unsigned(state, 10, 0,
+                                        KW_MEDIA_VIDEO | KW_MEDIA_AUDIO | KW_MEDIA_PLAYING,
+                                        &bits, NULL))
+        g_hash_table_replace(v->media_frames, g_strdup(message), GUINT_TO_POINTER((guint)bits));
+    g_free(message);
+    media_state_send(v, FALSE);
+}
+
+static void view_exit(KWView *v)
+{
+    if (v->exit_sent || !v->proxy)
+        return;
+    v->exit_sent = TRUE;
+    g_message("view %s: the page asks to leave", v->profile);
+    kodi_web_view_v1_exit(v->proxy);
+    kw_flush();
+}
+
+static void on_exit_message(WebKitUserContentManager *ucm, JSCValue *value, gpointer user_data)
+{
+    char *message;
+
+    (void)ucm;
+    if (!jsc_value_is_string(value))
+        return;
+    message = jsc_value_to_string(value);
+    if (!strcmp(message, "exit"))
+        view_exit(user_data);
+    g_free(message);
+}
+
+static void on_close(WebKitWebView *view, gpointer user_data)
+{
+    (void)view;
+    view_exit(user_data);
 }
 
 static void on_notify_title(WebKitWebView *view, GParamSpec *pspec, gpointer user_data)
@@ -557,6 +719,17 @@ static void on_notify_progress(WebKitWebView *view, GParamSpec *pspec, gpointer 
     kw_flush();
 }
 
+/* The engine's error page for a failed load commits under the failing URI. */
+static void load_committed(KWView *v, const char *uri)
+{
+    gboolean error_page = v->failed_uri && !g_strcmp0(uri, v->failed_uri);
+
+    g_clear_pointer(&v->failed_uri, g_free);
+    media_reset(v);
+    if (!error_page)
+        url_report(v, uri);
+}
+
 static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer user_data)
 {
     KWView *v = user_data;
@@ -569,7 +742,11 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
         /* New navigation: stop polling the previous page's favicon. */
         favicon_stop_poll(v);
         v->favicon_done = FALSE;
+        v->loading = TRUE;
     }
+
+    if (event == WEBKIT_LOAD_COMMITTED)
+        load_committed(v, webkit_web_view_get_uri(view));
 
     if (event == WEBKIT_LOAD_COMMITTED || event == WEBKIT_LOAD_FINISHED) {
         kodi_web_view_v1_navigation_state(v->proxy,
@@ -578,6 +755,7 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
     }
 
     if (event == WEBKIT_LOAD_FINISHED) {
+        v->loading = FALSE;
         v->crash_recovering = FALSE;     /* a load completed: recovery ok  */
         v->reload_started = FALSE;
 
@@ -597,10 +775,17 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
 static gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent event,
     const char *failing_uri, GError *error, gpointer user_data)
 {
-    (void)view;
-    (void)event;
-    (void)failing_uri;
     KWView *v = user_data;
+
+    (void)view;
+    /* a provisional load superseded by a newer navigation */
+    if (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED))
+        return TRUE;
+
+    if (event == WEBKIT_LOAD_STARTED || event == WEBKIT_LOAD_REDIRECTED) {
+        g_free(v->failed_uri);
+        v->failed_uri = g_strdup(failing_uri);
+    }
     kodi_web_view_v1_error(v->proxy, KODI_WEB_VIEW_V1_ERROR_CODE_LOAD_FAILED,
         (error && error->message) ? error->message : "load failed");
     kw_flush();
@@ -645,61 +830,6 @@ static gboolean on_permission_request(WebKitWebView *view,
     return FALSE;   /* default deny for all other permission types */
 }
 
-/* Best-effort recursive removal of a directory tree. */
-static void kw_rmrf(const char *path)
-{
-    GDir *d = g_dir_open(path, 0, NULL);
-    if (d) {
-        const char *name;
-        while ((name = g_dir_read_name(d))) {
-            char *child = g_build_filename(path, name, NULL);
-            if (g_file_test(child, G_FILE_TEST_IS_DIR) && !g_file_test(child, G_FILE_TEST_IS_SYMLINK))
-                kw_rmrf(child);
-            else
-                g_unlink(child);
-            g_free(child);
-        }
-        g_dir_close(d);
-    }
-    g_rmdir(path);
-}
-
-/* Remove every ephemeral default view's throwaway store. Used on the
- * disconnect/exit path, which ends in _exit() and so runs no clean teardown. */
-static void cleanup_temp_dirs(void)
-{
-    if (!g_views)
-        return;
-    GHashTableIter it;
-    gpointer key, val;
-    g_hash_table_iter_init(&it, g_views);
-    while (g_hash_table_iter_next(&it, &key, &val)) {
-        KWView *v = val;
-        if (v->tmp_dir)
-            kw_rmrf(v->tmp_dir);
-    }
-}
-
-/* Reap throwaway default stores left behind by a previous run (for example a
- * client killed, or one that exited through the Wayland disconnect path). */
-static void reap_stale_default_stores(void)
-{
-    const char *tmp = g_get_tmp_dir();
-    GDir *d = g_dir_open(tmp, 0, NULL);
-    if (!d)
-        return;
-    const char *name;
-    while ((name = g_dir_read_name(d))) {
-        if (!g_str_has_prefix(name, KW_DEFAULT_TMP_PREFIX))
-            continue;
-        char *p = g_build_filename(tmp, name, NULL);
-        if (g_file_test(p, G_FILE_TEST_IS_DIR) && !g_file_test(p, G_FILE_TEST_IS_SYMLINK))
-            kw_rmrf(p);
-        g_free(p);
-    }
-    g_dir_close(d);
-}
-
 static void view_destroy(KWView *v, gboolean send_protocol_destroy);
 
 static void on_web_process_terminated(WebKitWebView *view,
@@ -733,6 +863,9 @@ static void on_web_process_terminated(WebKitWebView *view,
     v->crash_recovering = TRUE;
     v->reload_started = FALSE;
     kodi_web_view_v1_error(v->proxy, KODI_WEB_VIEW_V1_ERROR_CODE_ENGINE_CRASHED, text);
+    g_hash_table_remove_all(v->media_frames);
+    v->playing_audio = FALSE;
+    media_state_send(v, FALSE);
     kw_flush();
 
     /* Recover in place: reload the current URL. url_changed follows from
@@ -772,262 +905,552 @@ static gboolean read_fd_exactly(int fd, uint32_t size, char **out, gsize *out_le
     return TRUE;
 }
 
-static void view_add_hbbtv_keys(KWView *v)
+static gboolean id_valid(const char *id)
 {
-    WebKitUserScript *script = webkit_user_script_new(HBBTV_KEY_EVENT_SCRIPT,
-        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
-        NULL, NULL);
-    webkit_user_content_manager_add_script(v->ucm, script);
-    webkit_user_script_unref(script);
-    v->hbbtv_keys = TRUE;
+    const char *p;
+
+    if (!id || !*id || strlen(id) > KW_PROFILE_MAX || !strcmp(id, ".") || !strcmp(id, ".."))
+        return FALSE;
+    for (p = id; *p; p++)
+        if (!g_ascii_isalnum(*p) && *p != '.' && *p != '_' && *p != '-')
+            return FALSE;
+    return TRUE;
+}
+
+static KWView *view_lookup(const char *profile, guint serial)
+{
+    KWView *v = g_hash_table_lookup(g_views, profile);
+
+    return v && v->serial == serial ? v : NULL;
+}
+
+static gboolean filter_id_referenced(const char *id)
+{
+    gboolean found = FALSE;
+    char **keys;
+    char *value;
+    gsize n = 0;
+    gsize i;
+
+    keys = g_key_file_get_keys(g_filter_index, KW_FILTER_INDEX_GROUP, &n, NULL);
+    for (i = 0; keys && i < n && !found; i++) {
+        value = g_key_file_get_string(g_filter_index, KW_FILTER_INDEX_GROUP, keys[i], NULL);
+        found = !g_strcmp0(value, id);
+        g_free(value);
+    }
+    g_strfreev(keys);
+    return found;
+}
+
+static void filter_file_remove(const char *id)
+{
+    char *path;
+
+    if (filter_id_referenced(id))
+        return;
+    path = g_strdup_printf("%s/" KW_FILTER_FILE_PREFIX "%s", g_filter_dir, id);
+    g_unlink(path);
+    g_free(path);
+}
+
+/* Keys are "<profile>/<filter>" and "@list/<list>"; NULL id removes the key. */
+static void filter_index_set(const char *key, const char *id)
+{
+    char *old = g_key_file_get_string(g_filter_index, KW_FILTER_INDEX_GROUP, key, NULL);
+    GError *error = NULL;
+
+    if (id)
+        g_key_file_set_string(g_filter_index, KW_FILTER_INDEX_GROUP, key, id);
+    else
+        g_key_file_remove_key(g_filter_index, KW_FILTER_INDEX_GROUP, key, NULL);
+
+    if (!g_key_file_save_to_file(g_filter_index, g_filter_index_path, &error)) {
+        g_warning("filters: cannot save %s: %s", g_filter_index_path, error->message);
+        g_error_free(error);
+    }
+
+    if (old && g_strcmp0(old, id))
+        filter_file_remove(old);
+    g_free(old);
+}
+
+static void filter_store_clean(void)
+{
+    GDir *dir = g_dir_open(g_filter_dir, 0, NULL);
+    const char *name;
+    char *path;
+
+    if (!dir)
+        return;
+    while ((name = g_dir_read_name(dir))) {
+        if (!g_str_has_prefix(name, KW_FILTER_FILE_PREFIX) ||
+            filter_id_referenced(name + strlen(KW_FILTER_FILE_PREFIX)))
+            continue;
+        path = g_build_filename(g_filter_dir, name, NULL);
+        g_unlink(path);
+        g_free(path);
+    }
+    g_dir_close(dir);
+}
+
+static void filter_lists_restore(void)
+{
+    char **keys;
+    gsize n = 0;
+    gsize i;
+
+    keys = g_key_file_get_keys(g_filter_index, KW_FILTER_INDEX_GROUP, &n, NULL);
+    for (i = 0; keys && i < n; i++) {
+        if (!g_str_has_prefix(keys[i], "@list/"))
+            continue;
+        g_hash_table_replace(g_lists_cached, g_strdup(keys[i] + strlen("@list/")),
+            g_key_file_get_string(g_filter_index, KW_FILTER_INDEX_GROUP, keys[i], NULL));
+    }
+    g_strfreev(keys);
+}
+
+static void filter_store_open(void)
+{
+    g_filter_dir = g_build_filename(g_get_user_data_dir(), "kodi-webview-filters", NULL);
+    g_filter_index_path = g_build_filename(g_filter_dir, "index", NULL);
+    g_filter_index = g_key_file_new();
+    g_lists = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    g_lists_cached = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    g_list_gen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    if (g_mkdir_with_parents(g_filter_dir, 0700))
+        g_warning("filters: cannot create %s: %s", g_filter_dir, g_strerror(errno));
+    g_key_file_load_from_file(g_filter_index, g_filter_index_path, G_KEY_FILE_NONE, NULL);
+    filter_store_clean();
+    filter_lists_restore();
+    g_filter_store = webkit_user_content_filter_store_new(g_filter_dir);
+}
+
+static void filter_lists_forget_cached(void)
+{
+    GHashTableIter it;
+    gpointer name;
+    char *key;
+
+    g_hash_table_iter_init(&it, g_lists_cached);
+    while (g_hash_table_iter_next(&it, &name, NULL)) {
+        key = g_strconcat("@list/", name, NULL);
+        filter_index_set(key, NULL);
+        g_free(key);
+    }
+    g_hash_table_remove_all(g_lists_cached);
+}
+
+static void view_pending_done(KWView *v)
+{
+    char *url;
+
+    if (!v->pending || --v->pending || !v->pending_url)
+        return;
+    url = v->pending_url;
+    v->pending_url = NULL;
+    if (!v->config_failed)
+        webkit_web_view_load_uri(v->web_view, url);
+    g_free(url);
+}
+
+static void view_config_fail(KWView *v, const char *what)
+{
+    g_warning("view %s: %s", v->profile, what);
+    g_clear_pointer(&v->pending_url, g_free);
+    if (v->config_failed)
+        return;
+    v->config_failed = TRUE;
+    kodi_web_view_v1_error(v->proxy, KODI_WEB_VIEW_V1_ERROR_CODE_CONFIG_FAILED, what);
+    kw_flush();
+}
+
+static gboolean view_filter_shared(KWView *v, const char *key, const char *id)
+{
+    GHashTableIter it;
+    gpointer other;
+    gpointer value;
+
+    g_hash_table_iter_init(&it, v->filters);
+    while (g_hash_table_iter_next(&it, &other, &value))
+        if (strcmp(other, key) && !strcmp(value, id))
+            return TRUE;
+    return FALSE;
+}
+
+static void view_filter_replace(KWView *v, const char *key, WebKitUserContentFilter *filter)
+{
+    const char *old = g_hash_table_lookup(v->filters, key);
+
+    if (old && !view_filter_shared(v, key, old))
+        webkit_user_content_manager_remove_filter_by_id(v->ucm, old);
+
+    if (!filter) {
+        g_hash_table_remove(v->filters, key);
+        return;
+    }
+    webkit_user_content_manager_add_filter(v->ucm, filter);
+    g_hash_table_replace(v->filters, g_strdup(key),
+                         g_strdup(webkit_user_content_filter_get_identifier(filter)));
+    g_message("view %s: content filter %s applied", v->profile, key);
+}
+
+typedef struct {
+    char *profile;
+    guint serial;
+    char *key;
+    char *id;
+    guint generation;
+    gboolean counted;
+} FilterLoad;
+
+static gboolean filter_load_current(KWView *v, FilterLoad *load)
+{
+    const char *name = strchr(load->key, ':') + 1;
+
+    if (g_str_has_prefix(load->key, "app:"))
+        return GPOINTER_TO_UINT(g_hash_table_lookup(v->filter_gen, name)) == load->generation;
+    return !g_strcmp0(g_hash_table_lookup(g_lists, name), load->id);
+}
+
+static void on_filter_loaded(GObject *source, GAsyncResult *res, gpointer data)
+{
+    WebKitUserContentFilter *filter;
+    FilterLoad *load = data;
+    GError *error = NULL;
+    gboolean current;
+    char *what;
+    KWView *v;
+
+    filter = webkit_user_content_filter_store_load_finish(WEBKIT_USER_CONTENT_FILTER_STORE(source),
+                                                          res, &error);
+    v = view_lookup(load->profile, load->serial);
+    current = v && filter_load_current(v, load);
+
+    if (current && filter) {
+        view_filter_replace(v, load->key, filter);
+    } else if (current && g_str_has_prefix(load->key, "app:")) {
+        what = g_strdup_printf("content filter %s: %s", load->key + 4, error->message);
+        view_config_fail(v, what);
+        g_free(what);
+    } else if (current) {
+        g_message("view %s: content filter list %s not applied: %s", v->profile,
+                  load->key + 5, error->message);
+    }
+
+    if (filter)
+        webkit_user_content_filter_unref(filter);
+    g_clear_error(&error);
+    if (v && load->counted)
+        view_pending_done(v);
+    g_free(load->profile);
+    g_free(load->key);
+    g_free(load->id);
+    g_free(load);
+}
+
+static void view_filter_load(KWView *v, const char *key, const char *id, guint generation,
+                             gboolean counted)
+{
+    FilterLoad *load = g_new0(FilterLoad, 1);
+
+    load->profile = g_strdup(v->profile);
+    load->serial = v->serial;
+    load->key = g_strdup(key);
+    load->id = g_strdup(id);
+    load->generation = generation;
+    load->counted = counted;
+    if (counted)
+        v->pending++;
+    webkit_user_content_filter_store_load(g_filter_store, id, v->cancellable, on_filter_loaded,
+                                          load);
+}
+
+typedef struct {
+    char *profile;
+    guint serial;
+    char *name;
+    guint generation;
+    GBytes *list;
+    GSubprocess *proc;
+} FilterJob;
+
+static void filter_job_free(FilterJob *job)
+{
+    g_free(job->profile);
+    g_free(job->name);
+    g_bytes_unref(job->list);
+    g_clear_object(&job->proc);
+    g_free(job);
+}
+
+static void list_prepared(FilterJob *job, const char *id, const char *why)
+{
+    GHashTableIter it;
+    gpointer value;
+    char *key;
+    KWView *v;
+
+    if (GPOINTER_TO_UINT(g_hash_table_lookup(g_list_gen, job->name)) != job->generation)
+        return;
+    if (!id) {
+        g_warning("content filter list %s cannot be applied, keeping the last one: %s",
+                  job->name, why);
+        return;
+    }
+
+    g_hash_table_replace(g_lists, g_strdup(job->name), g_strdup(id));
+    key = g_strconcat("@list/", job->name, NULL);
+    filter_index_set(key, id);
+    g_free(key);
+
+    key = g_strconcat("list:", job->name, NULL);
+    g_hash_table_iter_init(&it, g_views);
+    while (g_hash_table_iter_next(&it, NULL, &value)) {
+        v = value;
+        if (g_hash_table_contains(v->filter_lists, job->name))
+            view_filter_load(v, key, id, 0, FALSE);
+    }
+    g_free(key);
+}
+
+static void app_filter_compiled(FilterJob *job, const char *id, const char *why)
+{
+    KWView *v = view_lookup(job->profile, job->serial);
+    char *key;
+
+    if (!v)
+        return;
+
+    if (GPOINTER_TO_UINT(g_hash_table_lookup(v->filter_gen, job->name)) != job->generation) {
+        g_message("view %s: content filter %s replaced while compiling", v->profile, job->name);
+    } else if (!id) {
+        key = g_strdup_printf("content filter %s: %s", job->name, why);
+        view_config_fail(v, key);
+        g_free(key);
+    } else {
+        key = g_strconcat(v->profile, "/", job->name, NULL);
+        filter_index_set(key, id);
+        g_free(key);
+        key = g_strconcat("app:", job->name, NULL);
+        view_filter_load(v, key, id, job->generation, TRUE);
+        g_free(key);
+    }
+    view_pending_done(v);
+}
+
+static void filter_job_finish(FilterJob *job, const char *id, const char *why)
+{
+    if (job->profile)
+        app_filter_compiled(job, id, why);
+    else
+        list_prepared(job, id, why);
+}
+
+static void filter_jobs_next(GAsyncReadyCallback done)
+{
+    GSubprocessFlags flags = G_SUBPROCESS_FLAGS_STDIN_PIPE | G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+                             G_SUBPROCESS_FLAGS_STDERR_PIPE;
+    GError *error = NULL;
+    FilterJob *job;
+
+    while (!g_filter_busy && (job = g_queue_pop_head(&g_filter_jobs))) {
+        job->proc = g_subprocess_new(flags, &error, KW_FILTER_HELPER, g_filter_dir, NULL);
+        if (!job->proc) {
+            filter_job_finish(job, NULL, error->message);
+            g_clear_error(&error);
+            filter_job_free(job);
+            continue;
+        }
+        g_filter_busy = TRUE;
+        g_subprocess_communicate_async(job->proc, job->list, NULL, done, job);
+    }
+}
+
+static char *filter_job_log(FilterJob *job, GBytes *err)
+{
+    char *last = NULL;
+    char **lines;
+    char *text;
+    guint i;
+
+    if (!err)
+        return NULL;
+    text = g_strndup(g_bytes_get_data(err, NULL), g_bytes_get_size(err));
+    lines = g_strsplit(text, "\n", -1);
+    for (i = 0; lines[i]; i++) {
+        if (!*lines[i])
+            continue;
+        g_message("filter %s%s%s: %s", job->profile ? job->profile : "list",
+                  job->profile ? "/" : " ", job->name, lines[i]);
+        g_free(last);
+        last = g_strdup(lines[i]);
+    }
+    g_strfreev(lines);
+    g_free(text);
+    return last;
+}
+
+static void filter_job_done(GObject *source, GAsyncResult *res, gpointer data)
+{
+    GSubprocess *proc = G_SUBPROCESS(source);
+    FilterJob *job = data;
+    GBytes *out = NULL;
+    GBytes *err = NULL;
+    char *id = NULL;
+    char *why;
+
+    if (!g_subprocess_communicate_finish(proc, res, &out, &err, NULL))
+        why = g_strdup("the filter compiler could not be run");
+    else
+        why = filter_job_log(job, err);
+
+    if (out && g_subprocess_get_if_exited(proc) && !g_subprocess_get_exit_status(proc))
+        id = g_strstrip(g_strndup(g_bytes_get_data(out, NULL), g_bytes_get_size(out)));
+    if (id && (strlen(id) != 64 || strspn(id, "0123456789abcdef") != 64))
+        g_clear_pointer(&id, g_free);
+
+    filter_job_finish(job, id, why ? why : "the filter compiler failed");
+
+    g_free(id);
+    g_free(why);
+    if (out)
+        g_bytes_unref(out);
+    if (err)
+        g_bytes_unref(err);
+    filter_job_free(job);
+    g_filter_busy = FALSE;
+    filter_jobs_next(filter_job_done);
+}
+
+static void filter_job_queue(KWView *v, const char *name, guint generation, GBytes *list)
+{
+    FilterJob *job = g_new0(FilterJob, 1);
+
+    job->profile = v ? g_strdup(v->profile) : NULL;
+    job->serial = v ? v->serial : 0;
+    job->name = g_strdup(name);
+    job->generation = generation;
+    job->list = list;
+    g_queue_push_tail(&g_filter_jobs, job);
+    filter_jobs_next(filter_job_done);
 }
 
 static void view_set_user_agent(void *data, struct kodi_web_view_v1 *proxy,
     const char *user_agent)
 {
-    (void)proxy;
     KWView *v = data;
+
+    (void)proxy;
     if (!user_agent || !*user_agent) {
-        webkit_settings_set_user_agent(v->settings, NULL);  /* reset to default */
+        webkit_settings_set_user_agent(v->settings, NULL);
         return;
     }
     if (!ua_is_valid(user_agent)) {
-        /* A malformed UA trips WebCore::isValidUserAgentHeaderValue; keep the
-         * current one rather than take a critical. */
         g_warning("view %s: rejecting invalid user agent, keeping current: \"%s\"",
             v->profile, user_agent);
         return;
     }
     webkit_settings_set_user_agent(v->settings, user_agent);
-    if (!v->hbbtv_keys && strstr(user_agent, "HbbTV/"))
-        view_add_hbbtv_keys(v);
 }
 
 static void view_add_user_script(void *data, struct kodi_web_view_v1 *proxy,
     const char *name, int32_t fd, uint32_t size)
 {
-    (void)proxy;
+    WebKitUserScript *script;
     KWView *v = data;
     char *src = NULL;
     gsize len = 0;
-    gboolean ok = read_fd_exactly(fd, size, &src, &len);
+    gboolean ok;
+    char *what;
+
+    (void)proxy;
+    ok = read_fd_exactly(fd, size, &src, &len);
     close(fd);
-    if (!ok || !src) {
-        g_warning("user script %s: read failed", name ? name : "(unnamed)");
+    if (!ok || len < size) {
+        what = g_strdup_printf("user script %s: read %zu of %u bytes", name, len, size);
+        view_config_fail(v, what);
+        g_free(what);
         g_free(src);
         return;
     }
-    if (len < size)
-        g_warning("user script %s: short read (%zu of %u bytes)", name ? name : "(unnamed)",
-            (size_t)len, size);
-    char *nul = g_strndup(src, len);
-    g_free(src);
 
-    WebKitUserScript *script = webkit_user_script_new(nul,
-        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
-        NULL, NULL);
-    g_free(nul);
-    webkit_user_content_manager_add_script(v->ucm, script);  /* arrival order */
+    what = g_strndup(src, len);
+    script = webkit_user_script_new(what, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                                    WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    webkit_user_content_manager_add_script(v->ucm, script);
     webkit_user_script_unref(script);
-}
-
-typedef struct {
-    KWView *view;
-    char *name;
-    char *hash;
-} FilterSaveCtx;
-
-static void on_filter_saved(GObject *source, GAsyncResult *res, gpointer user_data)
-{
-    FilterSaveCtx *ctx = user_data;
-    GError *error = NULL;
-    WebKitUserContentFilter *filter = webkit_user_content_filter_store_save_finish(
-        WEBKIT_USER_CONTENT_FILTER_STORE(source), res, &error);
-    if (!filter) {
-        if (!error || !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-            g_warning("content filter %s compile/store failed: %s", ctx->name,
-                error ? error->message : "(no message)");
-        g_clear_error(&error);
-        g_free(ctx->name);
-        g_free(ctx->hash);
-        g_free(ctx);
-        return;
-    }
-    /* Replace any earlier filter under this name, then add the new one. */
-    webkit_user_content_manager_remove_filter_by_id(ctx->view->ucm, ctx->name);
-    webkit_user_content_manager_add_filter(ctx->view->ucm, filter);
-    webkit_user_content_filter_unref(filter);
-
-    g_hash_table_replace(ctx->view->filter_hashes, g_strdup(ctx->name), g_strdup(ctx->hash));
-
-    g_free(ctx->name);
-    g_free(ctx->hash);
-    g_free(ctx);
+    g_free(what);
+    g_free(src);
 }
 
 static void view_add_content_filter(void *data, struct kodi_web_view_v1 *proxy,
     const char *name, int32_t fd, uint32_t size)
 {
-    (void)proxy;
     KWView *v = data;
-    if (!v->filter_store) {
-        /* No store (ephemeral default without a temp dir): nothing to do. */
-        close(fd);
-        g_warning("view %s: no content-filter store, ignoring filter %s",
-            v->profile, name ? name : "(unnamed)");
-        return;
-    }
     char *src = NULL;
+    guint generation;
     gsize len = 0;
-    gboolean ok = read_fd_exactly(fd, size, &src, &len);
+    gboolean ok;
+    char *what;
+
+    (void)proxy;
+    ok = read_fd_exactly(fd, size, &src, &len);
     close(fd);
-    if (!ok || !src) {
-        g_warning("content filter %s: read failed", name ? name : "(unnamed)");
+    if (!id_valid(name) || !ok || len < size) {
+        what = g_strdup_printf("content filter %s: invalid name or read %zu of %u bytes",
+                               name, len, size);
+        view_config_fail(v, what);
+        g_free(what);
         g_free(src);
         return;
     }
 
-    char *hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256, (const guchar *)src, len);
-    const char *prev = g_hash_table_lookup(v->filter_hashes, name);
-    if (prev && g_strcmp0(prev, hash) == 0) {
-        /* Identical resend: compiled form already stored and added. */
-        g_free(src);
-        g_free(hash);
-        return;
-    }
-
-    GBytes *bytes = g_bytes_new_take(src, len);  /* takes ownership of src */
-    FilterSaveCtx *ctx = g_new0(FilterSaveCtx, 1);
-    ctx->view = v;
-    ctx->name = g_strdup(name);
-    ctx->hash = hash;   /* transferred */
-    webkit_user_content_filter_store_save(v->filter_store, name, bytes,
-        v->cancellable, on_filter_saved, ctx);
-    g_bytes_unref(bytes);
-}
-
-typedef struct {
-    KWView *view;
-    char *name;
-} FilterListCtx;
-
-static void on_filter_list_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
-{
-    FilterListCtx *ctx = user_data;
-    GError *error = NULL;
-    WebKitUserContentFilter *filter = webkit_user_content_filter_store_load_finish(
-        WEBKIT_USER_CONTENT_FILTER_STORE(source), res, &error);
-    if (!filter) {
-        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-            g_message("view %s: content filter list %s not loaded: %s", ctx->view->profile,
-                ctx->name, error ? error->message : "(no message)");
-        g_clear_error(&error);
-        g_free(ctx->name);
-        g_free(ctx);
-        return;
-    }
-    webkit_user_content_manager_remove_filter_by_id(ctx->view->ucm, ctx->name);
-    webkit_user_content_manager_add_filter(ctx->view->ucm, filter);
-    webkit_user_content_filter_unref(filter);
-    g_message("view %s: content filter list %s applied", ctx->view->profile, ctx->name);
-
-    g_free(ctx->name);
-    g_free(ctx);
-}
-
-static void view_filter_list_load(KWView *v, const char *name)
-{
-    FilterListCtx *ctx = g_new0(FilterListCtx, 1);
-    ctx->view = v;
-    ctx->name = g_strdup(name);
-    webkit_user_content_filter_store_load(g_list_store, name, v->cancellable,
-        on_filter_list_loaded, ctx);
+    generation = GPOINTER_TO_UINT(g_hash_table_lookup(v->filter_gen, name)) + 1;
+    g_hash_table_replace(v->filter_gen, g_strdup(name), GUINT_TO_POINTER(generation));
+    v->pending++;
+    filter_job_queue(v, name, generation, g_bytes_new_take(src, len));
 }
 
 static void view_add_content_filter_list(void *data, struct kodi_web_view_v1 *proxy,
     const char *name)
 {
-    (void)proxy;
     KWView *v = data;
-    if (!name || !*name)
-        return;
-    if (!g_list_store) {
-        g_warning("view %s: no content filter lists on this host, ignoring %s",
-            v->profile, name);
+    const char *id;
+    char *key;
+
+    (void)proxy;
+    if (!id_valid(name)) {
+        g_warning("view %s: ignoring content filter list with invalid name", v->profile);
         return;
     }
     g_hash_table_add(v->filter_lists, g_strdup(name));
-    view_filter_list_load(v, name);
-}
 
-#ifdef KW_CONTENT_FILTER_DIR
-#define KW_FILTER_LIST_PREFIX "ContentRuleList-"
-
-/* Lists are published by an atomic rename, so CREATED covers every update. */
-static void on_filter_lists_changed(GFileMonitor *monitor, GFile *file, GFile *other,
-    GFileMonitorEvent event, gpointer user_data)
-{
-    (void)monitor;
-    (void)other;
-    (void)user_data;
-    if (event != G_FILE_MONITOR_EVENT_CREATED && event != G_FILE_MONITOR_EVENT_DELETED)
+    id = g_hash_table_lookup(g_lists, name);
+    if (!id)
         return;
-
-    char *base = g_file_get_basename(file);
-    if (!base || !g_str_has_prefix(base, KW_FILTER_LIST_PREFIX)) {
-        g_free(base);
-        return;
-    }
-    const char *name = base + strlen(KW_FILTER_LIST_PREFIX);
-
-    GHashTableIter iter;
-    gpointer value;
-    g_hash_table_iter_init(&iter, g_views);
-    while (g_hash_table_iter_next(&iter, NULL, &value)) {
-        KWView *v = value;
-        if (!g_hash_table_contains(v->filter_lists, name))
-            continue;
-        if (event == G_FILE_MONITOR_EVENT_CREATED)
-            view_filter_list_load(v, name);
-        else
-            webkit_user_content_manager_remove_filter_by_id(v->ucm, name);
-    }
-    g_free(base);
+    key = g_strconcat("list:", name, NULL);
+    view_filter_load(v, key, id, 0, TRUE);
+    g_free(key);
 }
-
-static void filter_lists_watch(void)
-{
-    GError *error = NULL;
-    GFile *dir;
-
-    if (!g_file_test(KW_CONTENT_FILTER_DIR, G_FILE_TEST_IS_DIR)) {
-        g_message("no content filter lists in %s", KW_CONTENT_FILTER_DIR);
-        return;
-    }
-    dir = g_file_new_for_path(KW_CONTENT_FILTER_DIR);
-    g_list_monitor = g_file_monitor_directory(dir, G_FILE_MONITOR_NONE, NULL, &error);
-    g_object_unref(dir);
-    if (!g_list_monitor) {
-        g_warning("cannot watch %s: %s", KW_CONTENT_FILTER_DIR,
-            error ? error->message : "(no message)");
-        g_clear_error(&error);
-        return;
-    }
-    g_signal_connect(g_list_monitor, "changed", G_CALLBACK(on_filter_lists_changed), NULL);
-    g_list_store = webkit_user_content_filter_store_new(KW_CONTENT_FILTER_DIR);
-}
-#else
-static void filter_lists_watch(void)
-{
-}
-#endif
 
 static void view_load_url(void *data, struct kodi_web_view_v1 *proxy, const char *url)
 {
-    (void)proxy;
     KWView *v = data;
+
+    (void)proxy;
+    v->exit_sent = FALSE;
+    if (v->config_failed) {
+        kodi_web_view_v1_error(v->proxy, KODI_WEB_VIEW_V1_ERROR_CODE_CONFIG_FAILED,
+                               "the view's configuration could not be applied");
+        kw_flush();
+        return;
+    }
+    if (v->pending) {
+        g_free(v->pending_url);
+        v->pending_url = g_strdup(url ? url : "about:blank");
+        return;
+    }
     webkit_web_view_load_uri(v->web_view, url ? url : "about:blank");
 }
 
@@ -1082,11 +1505,11 @@ static const struct kodi_web_view_v1_listener view_listener = {
     view_set_user_agent,
     view_add_user_script,
     view_add_content_filter,
+    view_add_content_filter_list,
     view_load_url,
     view_navigate,
     view_set_active,
-    view_close,
-    view_add_content_filter_list
+    view_close
 };
 
 /* ------------------------------------------------------------------ */
@@ -1120,20 +1543,19 @@ static void view_free(gpointer data)
     g_clear_object(&v->web_view);
     g_clear_object(&v->session);
     g_clear_object(&v->settings);
+    if (v->ucm)
+        g_signal_handlers_disconnect_by_data(v->ucm, v);
     g_clear_object(&v->ucm);
-    g_clear_object(&v->filter_store);
     if (v->cancellable)
         g_object_unref(v->cancellable);
-    if (v->filter_hashes)
-        g_hash_table_destroy(v->filter_hashes);
-    if (v->filter_lists)
-        g_hash_table_destroy(v->filter_lists);
-    if (v->tmp_dir)
-        kw_rmrf(v->tmp_dir);   /* throwaway store for the ephemeral default */
+    g_hash_table_destroy(v->filters);
+    g_hash_table_destroy(v->filter_gen);
+    g_hash_table_destroy(v->filter_lists);
+    g_hash_table_destroy(v->media_frames);
     g_free(v->last_favicon_hash);
     g_free(v->current_url);
-    g_free(v->tmp_dir);
-    g_free(v->dir);
+    g_free(v->pending_url);
+    g_free(v->failed_uri);
     g_free(v->profile);
     g_free(v);
 
@@ -1169,106 +1591,98 @@ static WebKitNetworkSession *session_create(const char *data_dir, const char *ca
         "data-directory", data_dir, "cache-directory", cache_dir, "uplink", uplink, NULL));
 }
 
-/* Derive a filesystem-safe directory name from a verbatim profile id. */
-static char *profile_to_dir(const char *profile)
+static gboolean view_storage_create(KWView *v, const char *uplink, char **why)
 {
-    if (!profile || !*profile)
-        return g_strdup("default");
-    GString *s = g_string_new(NULL);
-    for (const char *c = profile; *c; c++)
-        g_string_append_c(s, g_ascii_isalnum(*c) ? *c : '-');
-    if (!s->len)
-        g_string_append(s, "default");
-    return g_string_free(s, FALSE);
+    WebKitCookieManager *cm;
+    char *cache_dir;
+    char *data_dir;
+    char *cookies;
+
+    if (v->ephemeral) {
+        v->session = session_create(NULL, NULL, uplink, why);
+        return v->session != NULL;
+    }
+
+    data_dir = g_build_filename(g_get_user_data_dir(), "kodi-webview", v->profile, NULL);
+    cache_dir = g_build_filename(g_get_user_cache_dir(), "kodi-webview", v->profile, NULL);
+    cookies = g_build_filename(data_dir, "cookies.db", NULL);
+
+    if (g_mkdir_with_parents(data_dir, 0700) || g_mkdir_with_parents(cache_dir, 0700))
+        *why = g_strdup_printf("cannot create profile storage under %s: %s", data_dir,
+                               g_strerror(errno));
+    else
+        v->session = session_create(data_dir, cache_dir, uplink, why);
+
+    if (v->session) {
+        cm = webkit_network_session_get_cookie_manager(v->session);
+        webkit_cookie_manager_set_persistent_storage(cm, cookies,
+                                                     WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+    }
+
+    g_free(data_dir);
+    g_free(cache_dir);
+    g_free(cookies);
+    return v->session != NULL;
+}
+
+static void view_scripts_add(KWView *v)
+{
+    WebKitUserScript *script;
+
+    g_signal_connect(v->ucm, "script-message-received::kodi", G_CALLBACK(on_exit_message), v);
+    g_signal_connect(v->ucm, "script-message-received::kodimedia",
+                     G_CALLBACK(on_media_message), v);
+    webkit_user_content_manager_register_script_message_handler(v->ucm, "kodi", NULL);
+    webkit_user_content_manager_register_script_message_handler(v->ucm, "kodimedia",
+                                                                KW_MEDIA_WORLD);
+
+    script = webkit_user_script_new(EXIT_SCRIPT, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                                    WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    webkit_user_content_manager_add_script(v->ucm, script);
+    webkit_user_script_unref(script);
+
+    script = webkit_user_script_new_for_world(MEDIA_SCRIPT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                                              WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+                                              KW_MEDIA_WORLD, NULL, NULL);
+    webkit_user_content_manager_add_script(v->ucm, script);
+    webkit_user_script_unref(script);
 }
 
 /*
  * Build the view: network session (ephemeral for "default", persistent
  * otherwise, bound to the uplink when one is given), settings, surface, and
- * the protocol proxy via create_view. The verbatim profile id is carried
- * into create_view; the on-disk path uses a sanitised directory name.
- * Returns NULL with *why set on failure. Does NOT load any URL (the caller
- * warms the default view only).
+ * the protocol proxy via create_view. Returns NULL with *why set on failure.
+ * Does NOT load any URL (the caller warms the default view only).
  */
 static KWView *view_create(const char *profile, const char *uplink, gboolean is_default,
     char **why)
 {
     *why = NULL;
 
-    /* Duplicate detection uses the verbatim id. */
-    if (g_hash_table_lookup(g_views, profile ? profile : "default")) {
-        *why = g_strdup_printf("a view for profile '%s' already exists",
-            profile ? profile : "default");
+    if (!id_valid(profile)) {
+        *why = g_strdup("invalid profile identifier");
+        return NULL;
+    }
+    if (g_hash_table_lookup(g_views, profile)) {
+        *why = g_strdup_printf("a view for profile '%s' already exists", profile);
         return NULL;
     }
 
     KWView *v = g_new0(KWView, 1);
-    v->profile = g_strdup(profile ? profile : "default");
-    v->dir = profile_to_dir(v->profile);
+    v->profile = g_strdup(profile);
+    v->serial = ++g_view_serial;
     v->is_default = is_default;
     v->ephemeral = (g_strcmp0(v->profile, "default") == 0);
     v->active = TRUE;
-    v->filter_hashes = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    v->filters = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    v->filter_gen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     v->filter_lists = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    v->media_frames = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     v->cancellable = g_cancellable_new();
 
-    char *store_dir = NULL;
-    char *icon_db_desc = NULL;   /* for logging where the icon DB lives */
-
-    if (v->ephemeral) {
-        /* Profile "default": fresh ephemeral session, nothing persistent on
-         * disk. Give the content filter store a throwaway temp directory.
-         * The favicon database of an ephemeral session is in-memory (the
-         * engine returns a null path for it), so icons work for the view's
-         * lifetime but are not persisted; that is fine for the warm default. */
-        v->session = session_create(NULL, NULL, uplink, why);
-        if (!v->session) {
-            view_free(v);
-            return NULL;
-        }
-        GError *e = NULL;
-        v->tmp_dir = g_dir_make_tmp(KW_DEFAULT_TMP_PREFIX "XXXXXX", &e);
-        if (v->tmp_dir)
-            store_dir = g_build_filename(v->tmp_dir, "filter-store", NULL);
-        g_clear_error(&e);
-        icon_db_desc = g_strdup("in-memory (ephemeral session)");
-    } else {
-        /* Persistent profile. Data honours XDG_DATA_HOME (g_get_user_data_dir)
-         * and cache honours XDG_CACHE_HOME (g_get_user_cache_dir); GLib uses
-         * the environment variables when set, which is what Kodi relies on for
-         * persistence across restarts. */
-        char *data_dir = g_build_filename(g_get_user_data_dir(), "kodi-webview", v->dir, NULL);
-        char *cache_dir = g_build_filename(g_get_user_cache_dir(), "kodi-webview", v->dir, NULL);
-        store_dir = g_build_filename(data_dir, "filter-store", NULL);
-        char *cookies = g_build_filename(data_dir, "cookies.db", NULL);
-
-        gboolean dirs_ok =
-            g_mkdir_with_parents(data_dir, 0700) == 0 &&
-            g_mkdir_with_parents(cache_dir, 0700) == 0 &&
-            g_mkdir_with_parents(store_dir, 0700) == 0;
-        if (!dirs_ok) {
-            *why = g_strdup_printf("cannot create profile storage under %s: %s",
-                data_dir, g_strerror(errno));
-            g_free(data_dir); g_free(cache_dir); g_free(store_dir); g_free(cookies);
-            view_free(v);
-            return NULL;
-        }
-
-        v->session = session_create(data_dir, cache_dir, uplink, why);
-        if (!v->session) {
-            g_free(data_dir); g_free(cache_dir); g_free(store_dir); g_free(cookies);
-            view_free(v);
-            return NULL;
-        }
-        WebKitCookieManager *cm = webkit_network_session_get_cookie_manager(v->session);
-        webkit_cookie_manager_set_persistent_storage(cm, cookies,
-            WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
-
-        /* The engine derives the favicon DB path from the session CACHE
-         * directory: <cache>/icondatabase/WebpageIcons.db. */
-        icon_db_desc = g_build_filename(cache_dir, "icondatabase", NULL);
-
-        g_free(data_dir); g_free(cache_dir); g_free(cookies);
+    if (!view_storage_create(v, uplink, why)) {
+        view_free(v);
+        return NULL;
     }
 
     /* Enable website icons on this view's session (off by default) so the
@@ -1276,15 +1690,10 @@ static KWView *view_create(const char *profile, const char *uplink, gboolean is_
     WebKitWebsiteDataManager *wdm = webkit_network_session_get_website_data_manager(v->session);
     webkit_website_data_manager_set_favicons_enabled(wdm, TRUE);
     v->favicon_db = webkit_website_data_manager_get_favicon_database(wdm);
-    g_message("favicon db: %s enabled=%d dir=%s", v->profile,
-        v->favicon_db ? 1 : 0, icon_db_desc ? icon_db_desc : "(unknown)");
-    g_free(icon_db_desc);
+    g_message("favicon db: %s enabled=%d", v->profile, v->favicon_db ? 1 : 0);
 
-    if (store_dir) {
-        v->filter_store = webkit_user_content_filter_store_new(store_dir);
-        g_free(store_dir);
-    }
     v->ucm = webkit_user_content_manager_new();
+    view_scripts_add(v);
 
     /* No user agent is set: the view uses the engine default until a valid
      * set_user_agent event arrives (per the protocol). */
@@ -1340,6 +1749,9 @@ static KWView *view_create(const char *profile, const char *uplink, gboolean is_
         G_CALLBACK(on_web_process_terminated), v);
     g_signal_connect(v->web_view, "permission-request",
         G_CALLBACK(on_permission_request), v);
+    g_signal_connect(v->web_view, "notify::is-playing-audio",
+                     G_CALLBACK(on_notify_playing_audio), v);
+    g_signal_connect(v->web_view, "close", G_CALLBACK(on_close), v);
 
     g_hash_table_insert(g_views, g_strdup(v->profile), v);
     kw_flush();
@@ -1367,8 +1779,64 @@ static void manager_want_view(void *data, struct kodi_web_manager_v1 *manager,
     /* No URL is loaded: configuration events then load_url will arrive. */
 }
 
+static void manager_content_filter_list(void *data, struct kodi_web_manager_v1 *manager,
+    const char *name, int32_t fd, uint32_t size)
+{
+    char *src = NULL;
+    guint generation;
+    gsize len = 0;
+    char *cached;
+    gboolean ok;
+
+    (void)data;
+    (void)manager;
+    ok = read_fd_exactly(fd, size, &src, &len);
+    close(fd);
+    if (!id_valid(name) || !ok || len < size) {
+        g_warning("content filter list %s: invalid name or read %zu of %u bytes", name, len,
+                  size);
+        g_free(src);
+        return;
+    }
+
+    if (g_hash_table_steal_extended(g_lists_cached, name, NULL, (gpointer *)&cached))
+        g_hash_table_replace(g_lists, g_strdup(name), cached);
+
+    generation = GPOINTER_TO_UINT(g_hash_table_lookup(g_list_gen, name)) + 1;
+    g_hash_table_replace(g_list_gen, g_strdup(name), GUINT_TO_POINTER(generation));
+    filter_job_queue(NULL, name, generation, g_bytes_new_take(src, len));
+}
+
+static void manager_remove_content_filter_list(void *data, struct kodi_web_manager_v1 *manager,
+    const char *name)
+{
+    GHashTableIter it;
+    guint generation;
+    gpointer value;
+    char *key;
+
+    (void)data;
+    (void)manager;
+    generation = GPOINTER_TO_UINT(g_hash_table_lookup(g_list_gen, name)) + 1;
+    g_hash_table_replace(g_list_gen, g_strdup(name), GUINT_TO_POINTER(generation));
+    g_hash_table_remove(g_lists, name);
+    g_hash_table_remove(g_lists_cached, name);
+
+    key = g_strconcat("@list/", name, NULL);
+    filter_index_set(key, NULL);
+    g_free(key);
+
+    key = g_strconcat("list:", name, NULL);
+    g_hash_table_iter_init(&it, g_views);
+    while (g_hash_table_iter_next(&it, NULL, &value))
+        view_filter_replace(value, key, NULL);
+    g_free(key);
+}
+
 static const struct kodi_web_manager_v1_listener manager_listener = {
-    manager_want_view
+    manager_want_view,
+    manager_content_filter_list,
+    manager_remove_content_filter_list
 };
 
 /* ------------------------------------------------------------------ */
@@ -1379,9 +1847,9 @@ static void registry_global(void *data, struct wl_registry *registry,
     uint32_t name, const char *interface, uint32_t version)
 {
     (void)data;
+    (void)version;
     if (g_strcmp0(interface, kodi_web_manager_v1_interface.name) == 0 && !g_manager) {
-        uint32_t bind_ver = version < 2 ? version : 2;
-        g_manager = wl_registry_bind(registry, name, &kodi_web_manager_v1_interface, bind_ver);
+        g_manager = wl_registry_bind(registry, name, &kodi_web_manager_v1_interface, 1);
         g_manager_name = name;
         kodi_web_manager_v1_add_listener(g_manager, &manager_listener, NULL);
     }
@@ -1415,10 +1883,6 @@ static void on_display_disconnected(WPEDisplay *display, GError *error, gpointer
         g_warning("WPE display disconnected: %s", error->message);
     else
         g_warning("WPE display disconnected");
-    /* This path ends the process directly (Kodi stop/restart ends the client
-     * here), so remove the ephemeral default views' throwaway stores before
-     * exiting; _exit() runs no atexit handlers. */
-    cleanup_temp_dirs();
     _exit(1);
 }
 
@@ -1453,6 +1917,9 @@ static void activate(GApplication *application, gpointer user_data)
         g_application_quit(application);
         return;
     }
+    g_views = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, view_free);
+    filter_store_open();
+
     g_registry = wl_display_get_registry(g_wl_display);
     wl_registry_add_listener(g_registry, &registry_listener, NULL);
     wl_display_roundtrip(g_wl_display);   /* receive and bind the manager */
@@ -1462,9 +1929,6 @@ static void activate(GApplication *application, gpointer user_data)
         g_application_quit(application);
         return;
     }
-
-    g_views = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, view_free);
-    filter_lists_watch();
 
     /* 3. Warm "default" view: create_view + about:blank; ready follows once
      * the default view's first load finishes (engine processes up). */
@@ -1594,9 +2058,6 @@ int main(int argc, char *argv[])
     kw_preload_for_widevine();
     kw_enable_adaptive_streaming();
 
-    /* Reap throwaway default stores left by a previous run before we start. */
-    reap_stale_default_stores();
-
     g_app = g_application_new("org.kodi.webview", G_APPLICATION_NON_UNIQUE);
     g_signal_connect(g_app, "activate", G_CALLBACK(activate), NULL);
 
@@ -1605,6 +2066,9 @@ int main(int argc, char *argv[])
 
     int status = g_application_run(g_app, 0, NULL);
 
+    /* the compositor sends the lists in use at some point during a run */
+    if (g_lists_cached)
+        filter_lists_forget_cached();
     if (g_views)
         g_hash_table_destroy(g_views);
     g_object_unref(g_app);
