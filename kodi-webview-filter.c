@@ -10,9 +10,13 @@
  */
 
 #include <errno.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <wpe/webkit.h>
@@ -122,7 +126,10 @@ static GBytes *list_convert(GBytes *list)
 int main(int argc, char **argv)
 {
     FilterJob job = { NULL, NULL, NULL, NULL, 1 };
+    struct rlimit nice_limit = { 0, 0 };
+    struct sched_param param = { 0 };
     GBytes *list;
+    int err;
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s STORE\n", argv[0]);
@@ -132,6 +139,15 @@ int main(int argc, char **argv)
     /* the client has no use for a compile it can no longer receive */
     if (prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() == 1)
         return 1;
+
+    /* WebKit sets its threads' scheduling; RLIMIT_NICE keeps them idle */
+    if (setpriority(PRIO_PROCESS, 0, 19))
+        fprintf(stderr, "nice 19: %s\n", strerror(errno));
+    err = pthread_setschedparam(pthread_self(), SCHED_IDLE, &param);
+    if (err)
+        fprintf(stderr, "SCHED_IDLE: %s\n", strerror(err));
+    if (setrlimit(RLIMIT_NICE, &nice_limit))
+        fprintf(stderr, "RLIMIT_NICE: %s\n", strerror(errno));
 
     list = stdin_read();
     if (!list)
