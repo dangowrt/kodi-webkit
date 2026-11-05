@@ -16,6 +16,9 @@
  *                               (SCM_RIGHTS) per DMA-BUF object
  *  Kodi -> sink  RELEASE        id of a frame Kodi no longer shows
  *  sink -> Kodi  CLEAR          the sink shows nothing until its next FRAME
+ *  sink -> Kodi  RECT           where on the view the video is shown, in the
+ *                               view's pixels; an empty one leaves the
+ *                               placement to Kodi
  *
  * The sink sends a frame when it is due and keeps it until Kodi releases it,
  * as Kodi scans the frame out from the memory the sink holds. Kodi releases
@@ -39,6 +42,7 @@ enum kodi_web_video_type
   KODI_WEB_VIDEO_FRAME,
   KODI_WEB_VIDEO_RELEASE,
   KODI_WEB_VIDEO_CLEAR,
+  KODI_WEB_VIDEO_RECT,
 };
 
 /* the matrix coefficients, as in ITU-T H.273 */
@@ -117,6 +121,15 @@ struct kodi_web_video_release
 struct kodi_web_video_clear
 {
   uint32_t type;
+};
+
+struct kodi_web_video_rect
+{
+  uint32_t type;
+  int32_t x;
+  int32_t y;
+  int32_t width;
+  int32_t height;
 };
 
 #endif

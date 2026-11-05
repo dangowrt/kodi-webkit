@@ -2029,7 +2029,7 @@ static void kw_route_video_to_kodi(void)
 
     webkit_web_context_add_path_to_sandbox(webkit_web_context_get_default(),
         path, FALSE);
-    g_setenv("WEBKIT_GST_CUSTOM_VIDEO_SINK", "kodivideosink", TRUE);
+    g_setenv("WEBKIT_GST_HOLE_PUNCH_QUIRK", "kodi", TRUE);
     g_video_plane = TRUE;
     g_message("video: pages show their video on Kodi's plane at %s", path);
 }

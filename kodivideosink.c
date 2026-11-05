@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -49,9 +50,60 @@ struct _GstKodiVideoSink {
     guint32 next_id;
 
     GstVideoInfoDmaDrm drm_info;
+
+    struct kodi_web_video_rect rect;
+};
+
+enum {
+    PROP_0,
+    PROP_RECTANGLE,
 };
 
 G_DEFINE_TYPE(GstKodiVideoSink, gst_kodi_video_sink, GST_TYPE_VIDEO_SINK)
+
+static void rect_send(GstKodiVideoSink *self)
+{
+    if (self->fd >= 0 &&
+        send(self->fd, &self->rect, sizeof(self->rect), MSG_NOSIGNAL) != sizeof(self->rect))
+        GST_WARNING_OBJECT(self, "cannot place Kodi's video: %s", g_strerror(errno));
+}
+
+static void gst_kodi_video_sink_set_property(GObject *object, guint id,
+    const GValue *value, GParamSpec *pspec)
+{
+    struct kodi_web_video_rect rect = { KODI_WEB_VIDEO_RECT, 0, 0, 0, 0 };
+    GstKodiVideoSink *self = GST_KODI_VIDEO_SINK(object);
+    const char *text;
+
+    if (id != PROP_RECTANGLE) {
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, id, pspec);
+        return;
+    }
+
+    text = g_value_get_string(value);
+    if (!text || sscanf(text, "%d,%d,%d,%d", &rect.x, &rect.y, &rect.width,
+            &rect.height) != 4)
+        return;
+    if (!memcmp(&rect, &self->rect, sizeof(rect)))
+        return;
+
+    self->rect = rect;
+    rect_send(self);
+}
+
+static void gst_kodi_video_sink_get_property(GObject *object, guint id,
+    GValue *value, GParamSpec *pspec)
+{
+    GstKodiVideoSink *self = GST_KODI_VIDEO_SINK(object);
+
+    if (id != PROP_RECTANGLE) {
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, id, pspec);
+        return;
+    }
+
+    g_value_take_string(value, g_strdup_printf("%d,%d,%d,%d", self->rect.x,
+        self->rect.y, self->rect.width, self->rect.height));
+}
 
 static void held_release(GstKodiVideoSink *self, guint32 id)
 {
@@ -165,6 +217,8 @@ static gboolean gst_kodi_video_sink_start(GstBaseSink *bsink)
     }
 
     self->receiver = g_thread_new("kodivideosink", receiver_run, self);
+    if (self->rect.width > 0 && self->rect.height > 0)
+        rect_send(self);
     GST_INFO_OBJECT(self, "connected to %s, %u formats", path,
         self->format_count);
     return TRUE;
@@ -414,6 +468,7 @@ static void gst_kodi_video_sink_init(GstKodiVideoSink *self)
 {
     self->fd = -1;
     self->wake_fd = -1;
+    self->rect.type = KODI_WEB_VIDEO_RECT;
     g_mutex_init(&self->lock);
     self->held = g_hash_table_new_full(NULL, NULL, NULL,
         (GDestroyNotify)gst_buffer_unref);
@@ -432,6 +487,12 @@ static void gst_kodi_video_sink_class_init(GstKodiVideoSinkClass *klass)
     gst_element_class_add_static_pad_template(element_class, &sink_template);
 
     object_class->finalize = gst_kodi_video_sink_finalize;
+    object_class->set_property = gst_kodi_video_sink_set_property;
+    object_class->get_property = gst_kodi_video_sink_get_property;
+    g_object_class_install_property(object_class, PROP_RECTANGLE,
+        g_param_spec_string("rectangle", "Rectangle",
+            "Where the video shows on the view, as x,y,width,height", NULL,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
     bsink_class->start = GST_DEBUG_FUNCPTR(gst_kodi_video_sink_start);
     bsink_class->stop = GST_DEBUG_FUNCPTR(gst_kodi_video_sink_stop);
     bsink_class->get_caps = GST_DEBUG_FUNCPTR(gst_kodi_video_sink_get_caps);
