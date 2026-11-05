@@ -184,10 +184,11 @@ static void kw_flush(void)
 /* ------------------------------------------------------------------ */
 /* GStreamer decoder-rank policy (KODI_WEBVIEW_SOFTWARE_CODECS)         */
 /*                                                                     */
-/* With 0 (default) we demote every software VIDEO decoder whose codec */
-/* has no hardware decoder, so the engine offers only codecs the box   */
-/* can decode in hardware. Ranks are process-global, so this is set    */
-/* both in this process (gst_plugin_feature_set_rank) and in the       */
+/* With 0 (default) every software VIDEO decoder ranks below the       */
+/* hardware decoders of its codec, so the engine prefers hardware and  */
+/* still offers codecs the box can only decode in software. Ranks are  */
+/* process-global, so this is set in this process                      */
+/* (gst_plugin_feature_set_rank) and in the                            */
 /* environment (GST_PLUGIN_FEATURE_RANK), which GStreamer core applies */
 /* at gst_init in each child engine process that inherits our env.     */
 /* ------------------------------------------------------------------ */
@@ -233,9 +234,47 @@ static gboolean factory_is_video_decoder(GstElementFactory *factory, gboolean *i
     return TRUE;
 }
 
+static void hw_ranks_add(GHashTable *hw_ranks, GstElementFactory *factory)
+{
+    guint rank = gst_plugin_feature_get_rank(GST_PLUGIN_FEATURE(factory));
+    const char *type;
+    GPtrArray *types;
+    gpointer known;
+    guint i;
+
+    if (rank == GST_RANK_NONE)
+        return;
+    types = factory_sink_video_types(factory);
+    for (i = 0; i < types->len; i++) {
+        type = g_ptr_array_index(types, i);
+        known = g_hash_table_lookup(hw_ranks, type);
+        if (!known || rank < GPOINTER_TO_UINT(known))
+            g_hash_table_insert(hw_ranks, g_strdup(type), GUINT_TO_POINTER(rank));
+    }
+    g_ptr_array_unref(types);
+}
+
+static guint hw_rank_lowest(GHashTable *hw_ranks, GstElementFactory *factory)
+{
+    GPtrArray *types = factory_sink_video_types(factory);
+    guint lowest = G_MAXUINT;
+    gpointer known;
+    guint i;
+
+    for (i = 0; i < types->len; i++) {
+        known = g_hash_table_lookup(hw_ranks, g_ptr_array_index(types, i));
+        if (known && GPOINTER_TO_UINT(known) < lowest)
+            lowest = GPOINTER_TO_UINT(known);
+    }
+    g_ptr_array_unref(types);
+    return lowest;
+}
+
 static void kw_apply_codec_policy(void)
 {
     const char *sw = g_getenv("KODI_WEBVIEW_SOFTWARE_CODECS");
+    guint hw_rank, rank;
+
     if (sw && g_strcmp0(sw, "1") == 0) {
         g_message("codec policy: KODI_WEBVIEW_SOFTWARE_CODECS=1, leaving decoder ranks untouched");
         return;
@@ -245,20 +284,17 @@ static void kw_apply_codec_policy(void)
     GstRegistry *registry = gst_registry_get();
     GList *features = gst_registry_get_feature_list(registry, GST_TYPE_ELEMENT_FACTORY);
 
-    /* Pass 1: codecs with a hardware decoder. */
+    /* Pass 1: the lowest hardware decoder rank of each codec. */
     GHashTable *hw_codecs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     for (GList *l = features; l; l = l->next) {
         GstElementFactory *factory = GST_ELEMENT_FACTORY(l->data);
         gboolean is_hw = FALSE;
         if (!factory_is_video_decoder(factory, &is_hw) || !is_hw)
             continue;
-        GPtrArray *types = factory_sink_video_types(factory);
-        for (guint i = 0; i < types->len; i++)
-            g_hash_table_add(hw_codecs, g_strdup(g_ptr_array_index(types, i)));
-        g_ptr_array_unref(types);
+        hw_ranks_add(hw_codecs, factory);
     }
 
-    /* Pass 2: demote software video decoders whose codecs have no hardware. */
+    /* Pass 2: rank software video decoders below the hardware of their codec. */
     GString *env = g_string_new(NULL);
     GPtrArray *demoted = g_ptr_array_new_with_free_func(g_free);
     for (GList *l = features; l; l = l->next) {
@@ -266,20 +302,17 @@ static void kw_apply_codec_policy(void)
         gboolean is_hw = FALSE;
         if (!factory_is_video_decoder(factory, &is_hw) || is_hw)
             continue;
-        GPtrArray *types = factory_sink_video_types(factory);
-        gboolean has_hw = FALSE;
-        for (guint i = 0; i < types->len; i++)
-            if (g_hash_table_contains(hw_codecs, g_ptr_array_index(types, i))) { has_hw = TRUE; break; }
-        g_ptr_array_unref(types);
-        if (has_hw || types->len == 0)
+        hw_rank = hw_rank_lowest(hw_codecs, factory);
+        rank = gst_plugin_feature_get_rank(GST_PLUGIN_FEATURE(factory));
+        if (hw_rank == G_MAXUINT || rank < hw_rank)
             continue;
 
-        gst_plugin_feature_set_rank(GST_PLUGIN_FEATURE(factory), GST_RANK_NONE);
+        gst_plugin_feature_set_rank(GST_PLUGIN_FEATURE(factory), hw_rank - 1);
         const char *name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
-        g_ptr_array_add(demoted, g_strdup(name));
+        g_ptr_array_add(demoted, g_strdup_printf("%s %u -> %u", name, rank, hw_rank - 1));
         if (env->len)
             g_string_append_c(env, ',');
-        g_string_append_printf(env, "%s:NONE", name);
+        g_string_append_printf(env, "%s:%u", name, hw_rank - 1);
     }
 
     if (demoted->len) {
@@ -297,7 +330,7 @@ static void kw_apply_codec_policy(void)
         g_setenv("GST_PLUGIN_FEATURE_RANK", merged, TRUE);
         g_free(merged);
     } else {
-        g_message("codec policy: no software-only video decoders to demote");
+        g_message("codec policy: hardware video decoders already rank first");
     }
 
     g_ptr_array_free(demoted, TRUE);
