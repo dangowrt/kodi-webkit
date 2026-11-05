@@ -21,11 +21,15 @@ SINK_DEPS := gstreamer-1.0 gstreamer-audio-1.0
 SINK_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(SINK_DEPS))
 SINK_LIBS := $(shell $(PKG_CONFIG) --libs $(SINK_DEPS))
 
+VSINK_DEPS := gstreamer-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0
+VSINK_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(VSINK_DEPS))
+VSINK_LIBS := $(shell $(PKG_CONFIG) --libs $(VSINK_DEPS))
+
 GENERATED := kodi-web-v1-client-protocol.h kodi-web-v1-protocol.c
 
-all: kodi-webview kodi-webview-filter libgstkodiaudiosink.so
+all: kodi-webview kodi-webview-filter libgstkodiaudiosink.so libgstkodivideosink.so
 
-kodi-webview: kodi-webview.c protocol/kodi-web-audio.h $(GENERATED)
+kodi-webview: kodi-webview.c protocol/kodi-web-audio.h protocol/kodi-web-video.h $(GENERATED)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPS_CFLAGS) -I. \
 		-DKW_FILTER_HELPER='"$(LIBEXECDIR)/kodi-webview-filter"' \
 		$(if $(WIDEVINE_PRELOAD),-DKW_WIDEVINE_PRELOAD='"$(WIDEVINE_PRELOAD)"') \
@@ -38,6 +42,9 @@ kodi-webview-filter: kodi-webview-filter.c filter-convert.c filter-convert.h
 libgstkodiaudiosink.so: kodiaudiosink.c protocol/kodi-web-audio.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $(SINK_CFLAGS) -I. -o $@ kodiaudiosink.c $(LDFLAGS) $(SINK_LIBS)
 
+libgstkodivideosink.so: kodivideosink.c protocol/kodi-web-video.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $(VSINK_CFLAGS) -I. -o $@ kodivideosink.c $(LDFLAGS) $(VSINK_LIBS)
+
 kodi-web-v1-client-protocol.h: protocol/kodi-web-v1.xml
 	$(WAYLAND_SCANNER) client-header $< $@
 
@@ -48,8 +55,9 @@ install: all
 	install -D -m 0755 kodi-webview $(DESTDIR)$(BINDIR)/kodi-webview
 	install -D -m 0755 kodi-webview-filter $(DESTDIR)$(LIBEXECDIR)/kodi-webview-filter
 	install -D -m 0755 libgstkodiaudiosink.so $(DESTDIR)$(GSTPLUGINDIR)/libgstkodiaudiosink.so
+	install -D -m 0755 libgstkodivideosink.so $(DESTDIR)$(GSTPLUGINDIR)/libgstkodivideosink.so
 
 clean:
-	rm -f kodi-webview kodi-webview-filter libgstkodiaudiosink.so $(GENERATED)
+	rm -f kodi-webview kodi-webview-filter libgstkodiaudiosink.so libgstkodivideosink.so $(GENERATED)
 
 .PHONY: all install clean

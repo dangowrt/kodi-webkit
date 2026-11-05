@@ -48,6 +48,7 @@
 
 #include "kodi-web-v1-client-protocol.h"
 #include "protocol/kodi-web-audio.h"
+#include "protocol/kodi-web-video.h"
 
 #ifndef KW_FILTER_HELPER
 #define KW_FILTER_HELPER "/usr/libexec/kodi-webview-filter"
@@ -80,6 +81,10 @@ static GHashTable *g_lists_cached = NULL;
 static GHashTable *g_list_gen = NULL;
 static GQueue g_filter_jobs = G_QUEUE_INIT;
 static gboolean g_filter_busy = FALSE;
+
+/* pages show their video on Kodi's plane, which the page covers where it paints */
+static gboolean g_video_plane = FALSE;
+static WebKitColor g_transparent = { 0.0, 0.0, 0.0, 0.0 };
 
 /* ------------------------------------------------------------------ */
 /* Per-view state                                                      */
@@ -1748,6 +1753,8 @@ static KWView *view_create(const char *profile, const char *uplink, gboolean is_
         "display", g_display,
         NULL));
     g_object_unref(policies);
+    if (g_video_plane)
+        webkit_web_view_set_background_color(v->web_view, &g_transparent);
 
     /* Obtain the wl_surface backing the view to hand to create_view. */
     WPEView *wpe_view = webkit_web_view_get_wpe_view(v->web_view);
@@ -2011,6 +2018,22 @@ static void kw_route_audio_to_kodi(void)
     g_message("audio: pages play through Kodi at %s", path);
 }
 
+static void kw_route_video_to_kodi(void)
+{
+    const char *path = g_getenv(KODI_WEB_VIDEO_ENV);
+
+    if (!path || !g_file_test(path, G_FILE_TEST_EXISTS)) {
+        g_message("video: no Kodi video socket, pages draw their video");
+        return;
+    }
+
+    webkit_web_context_add_path_to_sandbox(webkit_web_context_get_default(),
+        path, FALSE);
+    g_setenv("WEBKIT_GST_CUSTOM_VIDEO_SINK", "kodivideosink", TRUE);
+    g_video_plane = TRUE;
+    g_message("video: pages show their video on Kodi's plane at %s", path);
+}
+
 /* The engine binds and loads the CDM named by WPE_WIDEVINE_CDM_PATH. */
 static void kw_offer_widevine(void)
 {
@@ -2087,6 +2110,7 @@ int main(int argc, char *argv[])
      * pipeline (and the child processes that run it) start. */
     kw_apply_codec_policy();
     kw_route_audio_to_kodi();
+    kw_route_video_to_kodi();
     kw_offer_widevine();
     kw_preload_for_widevine();
     kw_enable_adaptive_streaming();
