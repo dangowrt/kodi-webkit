@@ -69,7 +69,6 @@ static struct wl_registry *g_registry = NULL;
 static struct kodi_web_manager_v1 *g_manager = NULL;
 static uint32_t g_manager_name = 0;
 static GHashTable *g_views = NULL;   /* profile id (char*, verbatim) -> KWView* */
-static gboolean g_ready_sent = FALSE;
 static guint g_view_serial = 0;
 
 static WebKitUserContentFilterStore *g_filter_store = NULL;
@@ -93,7 +92,6 @@ static WebKitColor g_transparent = { 0.0, 0.0, 0.0, 0.0 };
 typedef struct {
     char *profile;
     guint serial;
-    gboolean is_default;            /* the warm default view                 */
     gboolean ephemeral;             /* profile "default": no on-disk state    */
 
     WebKitNetworkSession *session;
@@ -800,12 +798,6 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
         /* No favicon-change signal in this build: poll the favicon database
          * from here (the icon may register slightly after load). */
         favicon_start_poll(v);
-
-        if (v->is_default && !g_ready_sent && g_manager) {
-            /* Engine processes are up and the warm default view exists. */
-            kodi_web_manager_v1_ready(g_manager);
-            g_ready_sent = TRUE;
-        }
     }
     kw_flush();
 }
@@ -1596,10 +1588,6 @@ static void view_free(gpointer data)
     g_free(v->failed_uri);
     g_free(v->profile);
     g_free(v);
-
-    /* The browser exits when no views remain. */
-    if (g_views && g_hash_table_size(g_views) == 0 && g_app)
-        g_application_quit(g_app);
 }
 
 /* A data_dir of NULL makes the session ephemeral. */
@@ -1690,10 +1678,9 @@ static void view_scripts_add(KWView *v)
  * Build the view: network session (ephemeral for "default", persistent
  * otherwise, bound to the uplink when one is given), settings, surface, and
  * the protocol proxy via create_view. Returns NULL with *why set on failure.
- * Does NOT load any URL (the caller warms the default view only).
+ * Does NOT load any URL.
  */
-static KWView *view_create(const char *profile, const char *uplink, gboolean is_default,
-    char **why)
+static KWView *view_create(const char *profile, const char *uplink, char **why)
 {
     *why = NULL;
 
@@ -1709,7 +1696,6 @@ static KWView *view_create(const char *profile, const char *uplink, gboolean is_
     KWView *v = g_new0(KWView, 1);
     v->profile = g_strdup(profile);
     v->serial = ++g_view_serial;
-    v->is_default = is_default;
     v->ephemeral = (g_strcmp0(v->profile, "default") == 0);
     v->active = TRUE;
     v->filters = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
@@ -1809,7 +1795,7 @@ static void manager_want_view(void *data, struct kodi_web_manager_v1 *manager,
     KWView *v;
 
     (void)data;
-    v = view_create(profile, uplink, FALSE, &why);
+    v = view_create(profile, uplink, &why);
     if (!v) {
         kodi_web_manager_v1_view_unavailable(manager, profile,
             why ? why : "view could not be created");
@@ -1930,9 +1916,6 @@ static void activate(GApplication *application, gpointer user_data)
 {
     WPEDisplayWayland *wayland;
     GError *error = NULL;
-    char *why = NULL;
-    KWView *def;
-
     (void)user_data;
     g_application_hold(application);
 
@@ -1970,17 +1953,7 @@ static void activate(GApplication *application, gpointer user_data)
         return;
     }
 
-    /* 3. Warm "default" view: create_view + about:blank; ready follows once
-     * the default view's first load finishes (engine processes up). */
-    def = view_create("default", NULL, TRUE, &why);
-    if (!def) {
-        g_printerr("kodi-webview: cannot create default view: %s\n",
-            why ? why : "unknown");
-        g_free(why);
-        g_application_quit(application);
-        return;
-    }
-    webkit_web_view_load_uri(def->web_view, "about:blank");
+    kodi_web_manager_v1_ready(g_manager);
     kw_flush();
 }
 

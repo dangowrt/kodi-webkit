@@ -62,16 +62,15 @@
 
       The compositor asks for a view of a profile with the want_view
       event; the browser answers with a create_view request for that
-      profile. The browser may also create views on its own, for example
-      the warm default view it keeps ready at start-up. One view per
-      profile: a second create_view for a profile the compositor already
-      knows is a protocol error.
+      profile and creates no view on its own. One view per profile: a
+      second create_view for a profile the compositor already knows is a
+      protocol error. The browser keeps running without views.
 
       A profile identifier is 1 to 255 bytes of ASCII letters, digits,
       '.', '_' and '-', other than "." and "..", compared case-sensitively.
-      The browser may use it verbatim as a file name. The identifier
-      "default" names the browser's own warm view, which keeps nothing
-      across runs.
+      The browser may use it verbatim as a file name. The profile
+      "default" keeps nothing across runs; the compositor opens pages that
+      belong to no other profile in it.
     </description>
 
     <enum name="error">
@@ -110,9 +109,9 @@
 
     <request name="ready">
       <description summary="the browser is ready to serve views">
-        Sent once the browser's engine processes are up and it can
-        create and load views without further start-up cost. The
-        compositor shows no web entry point as available before it.
+        Sent once the browser is connected and can create and load
+        views. The compositor shows no web entry point as available
+        before it.
       </description>
     </request>
 
