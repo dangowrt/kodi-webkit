@@ -120,6 +120,9 @@ typedef struct {
     int favicon_tries;              /* icon-fetch attempts for the current load */
     gboolean favicon_done;          /* an icon was delivered for this load    */
 
+    guint viewport_width;           /* CSS viewport the page is written for   */
+    guint viewport_height;
+
     char *current_url;              /* last committed URL, for recovery       */
     gboolean active;
     gboolean crash_recovering;      /* set on crash, cleared on next load     */
@@ -1384,6 +1387,37 @@ static void view_set_user_agent(void *data, struct kodi_web_view_v1 *proxy,
     webkit_settings_set_user_agent(v->settings, user_agent);
 }
 
+static void view_zoom_update(KWView *v)
+{
+    WPEView *view = webkit_web_view_get_wpe_view(v->web_view);
+    double zoom = 1.0;
+    int height;
+    int width;
+
+    width = view ? wpe_view_get_width(view) : 0;
+    height = view ? wpe_view_get_height(view) : 0;
+    if (v->viewport_width && v->viewport_height && width > 0 && height > 0)
+        zoom = MIN((double)width / v->viewport_width, (double)height / v->viewport_height);
+    webkit_web_view_set_zoom_level(v->web_view, zoom);
+}
+
+static void on_view_resized(WPEView *view, gpointer user_data)
+{
+    (void)view;
+    view_zoom_update(user_data);
+}
+
+static void view_set_viewport(void *data, struct kodi_web_view_v1 *proxy, uint32_t width,
+    uint32_t height)
+{
+    KWView *v = data;
+
+    (void)proxy;
+    v->viewport_width = width;
+    v->viewport_height = height;
+    view_zoom_update(v);
+}
+
 static void view_add_user_script(void *data, struct kodi_web_view_v1 *proxy,
     const char *name, int32_t fd, uint32_t size)
 {
@@ -1539,7 +1573,8 @@ static const struct kodi_web_view_v1_listener view_listener = {
     view_load_url,
     view_navigate,
     view_set_active,
-    view_close
+    view_close,
+    view_set_viewport
 };
 
 /* ------------------------------------------------------------------ */
@@ -1570,6 +1605,8 @@ static void view_free(gpointer data)
         g_source_remove(v->favicon_retry_id);
     if (v->proxy)
         kodi_web_view_v1_destroy(v->proxy);
+    if (v->web_view)
+        g_signal_handlers_disconnect_by_data(webkit_web_view_get_wpe_view(v->web_view), v);
     g_clear_object(&v->web_view);
     g_clear_object(&v->session);
     g_clear_object(&v->settings);
@@ -1778,6 +1815,7 @@ static KWView *view_create(const char *profile, const char *uplink, char **why)
     g_signal_connect(v->web_view, "notify::is-playing-audio",
                      G_CALLBACK(on_notify_playing_audio), v);
     g_signal_connect(v->web_view, "close", G_CALLBACK(on_close), v);
+    g_signal_connect(wpe_view, "resized", G_CALLBACK(on_view_resized), v);
 
     g_hash_table_insert(g_views, g_strdup(v->profile), v);
     kw_flush();
@@ -1873,9 +1911,9 @@ static void registry_global(void *data, struct wl_registry *registry,
     uint32_t name, const char *interface, uint32_t version)
 {
     (void)data;
-    (void)version;
     if (g_strcmp0(interface, kodi_web_manager_v1_interface.name) == 0 && !g_manager) {
-        g_manager = wl_registry_bind(registry, name, &kodi_web_manager_v1_interface, 1);
+        g_manager = wl_registry_bind(registry, name, &kodi_web_manager_v1_interface,
+                                     MIN(version, 2));
         g_manager_name = name;
         kodi_web_manager_v1_add_listener(g_manager, &manager_listener, NULL);
     }
