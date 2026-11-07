@@ -57,6 +57,8 @@
 #define KW_FILTER_FILE_PREFIX "ContentRuleList-"
 #define KW_FILTER_INDEX_GROUP "filters"
 #define KW_PROFILE_MAX 255
+/* data-directory, cache-directory, disk-cache-enabled, uplink */
+#define KW_SESSION_PROPERTIES_MAX 4
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                             */
@@ -83,6 +85,7 @@ static gboolean g_filter_busy = FALSE;
 
 /* pages show their video on Kodi's plane, which the page covers where it paints */
 static gboolean g_video_plane = FALSE;
+static gboolean g_disk_cache = TRUE;
 static WebKitColor g_transparent = { 0.0, 0.0, 0.0, 0.0 };
 
 /* ------------------------------------------------------------------ */
@@ -1627,31 +1630,80 @@ static void view_free(gpointer data)
     g_free(v);
 }
 
+static gboolean session_property_exists(const char *name)
+{
+    GObjectClass *klass;
+    gboolean found;
+
+    klass = g_type_class_ref(WEBKIT_TYPE_NETWORK_SESSION);
+    found = g_object_class_find_property(klass, name) != NULL;
+    g_type_class_unref(klass);
+    return found;
+}
+
+static void kw_choose_disk_cache(void)
+{
+    if (g_strcmp0(g_getenv("KODI_WEBVIEW_DISK_CACHE"), "0"))
+        return;
+    if (!session_property_exists("disk-cache-enabled")) {
+        g_warning("the engine cannot keep HTTP resources in memory only, caching them on disk");
+        return;
+    }
+    g_disk_cache = FALSE;
+    g_message("HTTP resources are cached in memory only");
+}
+
+static void session_property_set_string(const char **names, GValue *values, guint *n,
+    const char *name, const char *value)
+{
+    names[*n] = name;
+    g_value_init(&values[*n], G_TYPE_STRING);
+    g_value_set_string(&values[*n], value);
+    (*n)++;
+}
+
+static void session_property_set_boolean(const char **names, GValue *values, guint *n,
+    const char *name, gboolean value)
+{
+    names[*n] = name;
+    g_value_init(&values[*n], G_TYPE_BOOLEAN);
+    g_value_set_boolean(&values[*n], value);
+    (*n)++;
+}
+
 /* A data_dir of NULL makes the session ephemeral. */
 static WebKitNetworkSession *session_create(const char *data_dir, const char *cache_dir,
     const char *uplink, char **why)
 {
-    GObjectClass *klass;
-    gboolean supported;
+    GValue values[KW_SESSION_PROPERTIES_MAX] = { G_VALUE_INIT };
+    const char *names[KW_SESSION_PROPERTIES_MAX];
+    WebKitNetworkSession *session;
+    guint n = 0;
+    guint i;
 
-    if (!uplink || !*uplink)
-        return data_dir ? webkit_network_session_new(data_dir, cache_dir)
-                        : webkit_network_session_new_ephemeral();
-
-    klass = g_type_class_ref(WEBKIT_TYPE_NETWORK_SESSION);
-    supported = g_object_class_find_property(klass, "uplink") != NULL;
-    g_type_class_unref(klass);
-    if (!supported) {
+    if (uplink && *uplink && !session_property_exists("uplink")) {
         *why = g_strdup_printf("the engine cannot bind connections to uplink '%s'", uplink);
         return NULL;
     }
 
-    g_message("network session bound to uplink '%s'", uplink);
-    if (!data_dir)
-        return WEBKIT_NETWORK_SESSION(g_object_new(WEBKIT_TYPE_NETWORK_SESSION,
-            "is-ephemeral", TRUE, "uplink", uplink, NULL));
-    return WEBKIT_NETWORK_SESSION(g_object_new(WEBKIT_TYPE_NETWORK_SESSION,
-        "data-directory", data_dir, "cache-directory", cache_dir, "uplink", uplink, NULL));
+    if (!data_dir) {
+        session_property_set_boolean(names, values, &n, "is-ephemeral", TRUE);
+    } else {
+        session_property_set_string(names, values, &n, "data-directory", data_dir);
+        session_property_set_string(names, values, &n, "cache-directory", cache_dir);
+        if (!g_disk_cache)
+            session_property_set_boolean(names, values, &n, "disk-cache-enabled", FALSE);
+    }
+    if (uplink && *uplink) {
+        g_message("network session bound to uplink '%s'", uplink);
+        session_property_set_string(names, values, &n, "uplink", uplink);
+    }
+
+    session = WEBKIT_NETWORK_SESSION(g_object_new_with_properties(WEBKIT_TYPE_NETWORK_SESSION,
+                                                                  n, names, values));
+    for (i = 0; i < n; i++)
+        g_value_unset(&values[i]);
+    return session;
 }
 
 static gboolean view_storage_create(KWView *v, const char *uplink, char **why)
@@ -1979,6 +2031,7 @@ static void activate(GApplication *application, gpointer user_data)
         return;
     }
     g_views = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, view_free);
+    kw_choose_disk_cache();
     filter_store_open();
 
     g_registry = wl_display_get_registry(g_wl_display);
