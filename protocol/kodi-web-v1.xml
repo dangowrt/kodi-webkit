@@ -55,7 +55,7 @@
     the protocol and interface names and resetting the interface version.
   </description>
 
-  <interface name="kodi_web_manager_v1" version="2">
+  <interface name="kodi_web_manager_v1" version="3">
     <description summary="create and announce web views">
       The global through which the browser announces itself and creates
       views. A browser binds it once.
@@ -156,10 +156,10 @@
         replaces it. Views apply a list once they ask for it with
         add_content_filter_list.
 
-        The browser prepares the list at once, independently of any view.
-        A list the browser cannot apply is treated as not there; views
-        keep the last version of it they applied. The fd holds exactly
-        size bytes; the browser closes it.
+        The browser prepares the list at once, independently of any view,
+        and reports the outcome with content_filter_list_prepared. A list
+        the browser cannot prepare leaves the version it prepared before
+        in place. The fd holds exactly size bytes; the browser closes it.
       </description>
       <arg name="name" type="string" summary="list identifier, same syntax as a profile identifier"/>
       <arg name="fd" type="fd" summary="the filter list"/>
@@ -173,9 +173,21 @@
       </description>
       <arg name="name" type="string" summary="list identifier"/>
     </event>
+
+    <request name="content_filter_list_prepared" since="3">
+      <description summary="a shared content filter list is prepared">
+        The browser has prepared the list of this name a
+        content_filter_list event handed it, so that views can apply it,
+        or it could not and holds no earlier version of the list (prepared
+        0). A list the browser kept prepared from an earlier run is
+        reported as prepared as soon as it is handed again.
+      </description>
+      <arg name="name" type="string" summary="list identifier"/>
+      <arg name="prepared" type="uint" summary="1 if views can apply the list, 0 if not"/>
+    </request>
   </interface>
 
-  <interface name="kodi_web_view_v1" version="2">
+  <interface name="kodi_web_view_v1" version="3">
     <description summary="one web view of one profile">
       A view is one page container bound to one surface. The compositor
       drives it with events and learns its state through requests.
@@ -349,9 +361,12 @@
     <event name="add_content_filter_list">
       <description summary="apply a shared content filter list to this view">
         Apply the shared list of this name, as sent by the
-        content_filter_list event of the manager. A list that is not
-        there yet, or that is replaced later, is applied to this view once
-        it is there; a list that is removed is removed from the view.
+        content_filter_list event of the manager. The view loads nothing
+        before the list is prepared: load_url waits for a list that is not
+        there yet, and a list that cannot be prepared, with no earlier
+        version to keep, or that is removed before it is, is
+        config_failed. A list replaced later is applied to this view once
+        it is prepared; a list that is removed is removed from the view.
       </description>
       <arg name="name" type="string" summary="list identifier"/>
     </event>

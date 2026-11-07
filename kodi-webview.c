@@ -109,6 +109,7 @@ typedef struct {
     GHashTable *filters;
     GHashTable *filter_gen;
     GHashTable *filter_lists;
+    GHashTable *lists_waiting;      /* lists not prepared yet, each pending   */
     guint pending;
     char *pending_url;
     gboolean config_failed;
@@ -1220,9 +1221,46 @@ static void filter_job_free(FilterJob *job)
     g_free(job);
 }
 
+/* views waiting for the list apply it now, or fail without one */
+static void list_waiters_resolve(const char *name, const char *id)
+{
+    GHashTableIter it;
+    gpointer value;
+    char *what;
+    char *key;
+    KWView *v;
+
+    key = g_strconcat("list:", name, NULL);
+    g_hash_table_iter_init(&it, g_views);
+    while (g_hash_table_iter_next(&it, NULL, &value)) {
+        v = value;
+        if (!g_hash_table_remove(v->lists_waiting, name))
+            continue;
+        if (id) {
+            view_filter_load(v, key, id, 0, TRUE);
+        } else {
+            what = g_strdup_printf("content filter list %s cannot be prepared", name);
+            view_config_fail(v, what);
+            g_free(what);
+        }
+        view_pending_done(v);
+    }
+    g_free(key);
+}
+
+static void list_report(const char *name, gboolean prepared)
+{
+    if (wl_proxy_get_version((struct wl_proxy *)g_manager) <
+        KODI_WEB_MANAGER_V1_CONTENT_FILTER_LIST_PREPARED_SINCE_VERSION)
+        return;
+    kodi_web_manager_v1_content_filter_list_prepared(g_manager, name, prepared);
+    kw_flush();
+}
+
 static void list_prepared(FilterJob *job, const char *id, const char *why)
 {
     GHashTableIter it;
+    const char *last;
     gpointer value;
     char *key;
     KWView *v;
@@ -1230,8 +1268,11 @@ static void list_prepared(FilterJob *job, const char *id, const char *why)
     if (GPOINTER_TO_UINT(g_hash_table_lookup(g_list_gen, job->name)) != job->generation)
         return;
     if (!id) {
-        g_warning("content filter list %s cannot be applied, keeping the last one: %s",
-                  job->name, why);
+        last = g_hash_table_lookup(g_lists, job->name);
+        g_warning("content filter list %s cannot be prepared, %s: %s", job->name,
+                  last ? "keeping the last one" : "none to keep", why);
+        list_waiters_resolve(job->name, last);
+        list_report(job->name, last != NULL);
         return;
     }
 
@@ -1244,10 +1285,13 @@ static void list_prepared(FilterJob *job, const char *id, const char *why)
     g_hash_table_iter_init(&it, g_views);
     while (g_hash_table_iter_next(&it, NULL, &value)) {
         v = value;
-        if (g_hash_table_contains(v->filter_lists, job->name))
+        if (g_hash_table_contains(v->filter_lists, job->name) &&
+            !g_hash_table_contains(v->lists_waiting, job->name))
             view_filter_load(v, key, id, 0, FALSE);
     }
     g_free(key);
+    list_waiters_resolve(job->name, id);
+    list_report(job->name, TRUE);
 }
 
 static void app_filter_compiled(FilterJob *job, const char *id, const char *why)
@@ -1494,8 +1538,11 @@ static void view_add_content_filter_list(void *data, struct kodi_web_view_v1 *pr
     g_hash_table_add(v->filter_lists, g_strdup(name));
 
     id = g_hash_table_lookup(g_lists, name);
-    if (!id)
+    if (!id) {
+        if (g_hash_table_add(v->lists_waiting, g_strdup(name)))
+            v->pending++;
         return;
+    }
     key = g_strconcat("list:", name, NULL);
     view_filter_load(v, key, id, 0, TRUE);
     g_free(key);
@@ -1621,6 +1668,7 @@ static void view_free(gpointer data)
     g_hash_table_destroy(v->filters);
     g_hash_table_destroy(v->filter_gen);
     g_hash_table_destroy(v->filter_lists);
+    g_hash_table_destroy(v->lists_waiting);
     g_hash_table_destroy(v->media_frames);
     g_free(v->last_favicon_hash);
     g_free(v->current_url);
@@ -1790,6 +1838,7 @@ static KWView *view_create(const char *profile, const char *uplink, char **why)
     v->filters = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     v->filter_gen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     v->filter_lists = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    v->lists_waiting = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     v->media_frames = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     v->cancellable = g_cancellable_new();
 
@@ -1915,8 +1964,11 @@ static void manager_content_filter_list(void *data, struct kodi_web_manager_v1 *
         return;
     }
 
-    if (g_hash_table_steal_extended(g_lists_cached, name, NULL, (gpointer *)&cached))
+    if (g_hash_table_steal_extended(g_lists_cached, name, NULL, (gpointer *)&cached)) {
         g_hash_table_replace(g_lists, g_strdup(name), cached);
+        list_waiters_resolve(name, cached);
+        list_report(name, TRUE);
+    }
 
     generation = GPOINTER_TO_UINT(g_hash_table_lookup(g_list_gen, name)) + 1;
     g_hash_table_replace(g_list_gen, g_strdup(name), GUINT_TO_POINTER(generation));
@@ -1937,6 +1989,7 @@ static void manager_remove_content_filter_list(void *data, struct kodi_web_manag
     g_hash_table_replace(g_list_gen, g_strdup(name), GUINT_TO_POINTER(generation));
     g_hash_table_remove(g_lists, name);
     g_hash_table_remove(g_lists_cached, name);
+    list_waiters_resolve(name, NULL);
 
     key = g_strconcat("@list/", name, NULL);
     filter_index_set(key, NULL);
@@ -1965,7 +2018,7 @@ static void registry_global(void *data, struct wl_registry *registry,
     (void)data;
     if (g_strcmp0(interface, kodi_web_manager_v1_interface.name) == 0 && !g_manager) {
         g_manager = wl_registry_bind(registry, name, &kodi_web_manager_v1_interface,
-                                     MIN(version, 2));
+                                     MIN(version, 3));
         g_manager_name = name;
         kodi_web_manager_v1_add_listener(g_manager, &manager_listener, NULL);
     }
