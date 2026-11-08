@@ -55,7 +55,7 @@
     the protocol and interface names and resetting the interface version.
   </description>
 
-  <interface name="kodi_web_manager_v1" version="3">
+  <interface name="kodi_web_manager_v1" version="4">
     <description summary="create and announce web views">
       The global through which the browser announces itself and creates
       views. A browser binds it once.
@@ -187,7 +187,7 @@
     </request>
   </interface>
 
-  <interface name="kodi_web_view_v1" version="3">
+  <interface name="kodi_web_view_v1" version="4">
     <description summary="one web view of one profile">
       A view is one page container bound to one surface. The compositor
       drives it with events and learns its state through requests.
@@ -417,6 +417,19 @@
       </description>
       <arg name="width" type="uint" summary="viewport width in CSS pixels"/>
       <arg name="height" type="uint" summary="viewport height in CSS pixels"/>
+    </event>
+
+    <event name="set_software_video_decoding" since="4">
+      <description summary="whether pages may play video decoded in software">
+        Whether the view's pages may play video that the browser decodes
+        in software. Without it, the browser offers pages only the video
+        codecs it decodes in hardware, so that a page choosing among
+        several codecs picks one of those. Video that a content decryption
+        module decrypts and decodes itself is not affected. Takes effect
+        from the next navigation. A view configured without it plays
+        video decoded in hardware only.
+      </description>
+      <arg name="allowed" type="uint" summary="1 to allow software video decoding"/>
     </event>
   </interface>
 </protocol>

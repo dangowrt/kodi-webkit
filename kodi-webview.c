@@ -138,6 +138,11 @@ typedef struct {
 #define KW_MEDIA_PLAYING (1u << 2)
 #define KW_MEDIA_SENT    (1u << 3)
 
+/* Every video codec name in WebKit's GStreamer decoder map, as patterns. */
+#define KW_HARDWARE_VIDEO_TYPES \
+    "*; codecs=\"avc*,x-h264,mp4v*,hvc1*,hev1*,x-h265,vp8*,x-vp8,vp9*,vp09*,x-vp9," \
+    "av01*,av1,x-av1,theora\""
+
 /* window.close() of the top document asks Kodi to leave the app */
 static const char EXIT_SCRIPT[] =
     "(function () {\n"
@@ -1465,6 +1470,16 @@ static void view_set_viewport(void *data, struct kodi_web_view_v1 *proxy, uint32
     view_zoom_update(v);
 }
 
+static void view_set_software_video_decoding(void *data, struct kodi_web_view_v1 *proxy,
+    uint32_t allowed)
+{
+    KWView *v = data;
+
+    (void)proxy;
+    webkit_settings_set_media_content_types_requiring_hardware_support(v->settings,
+        allowed ? NULL : KW_HARDWARE_VIDEO_TYPES);
+}
+
 static void view_add_user_script(void *data, struct kodi_web_view_v1 *proxy,
     const char *name, int32_t fd, uint32_t size)
 {
@@ -1624,7 +1639,8 @@ static const struct kodi_web_view_v1_listener view_listener = {
     view_navigate,
     view_set_active,
     view_close,
-    view_set_viewport
+    view_set_viewport,
+    view_set_software_video_decoding
 };
 
 /* ------------------------------------------------------------------ */
@@ -1864,6 +1880,7 @@ static KWView *view_create(const char *profile, const char *uplink, char **why)
         "enable-mediasource", TRUE,
         "media-playback-requires-user-gesture", FALSE,
         "enable-encrypted-media", TRUE,
+        "media-content-types-requiring-hardware-support", KW_HARDWARE_VIDEO_TYPES,
         NULL);
 
     WebKitWebsitePolicies *policies = webkit_website_policies_new_with_policies(
@@ -2018,7 +2035,7 @@ static void registry_global(void *data, struct wl_registry *registry,
     (void)data;
     if (g_strcmp0(interface, kodi_web_manager_v1_interface.name) == 0 && !g_manager) {
         g_manager = wl_registry_bind(registry, name, &kodi_web_manager_v1_interface,
-                                     MIN(version, 3));
+                                     MIN(version, 4));
         g_manager_name = name;
         kodi_web_manager_v1_add_listener(g_manager, &manager_listener, NULL);
     }
