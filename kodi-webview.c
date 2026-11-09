@@ -115,6 +115,7 @@ typedef struct {
     gboolean config_failed;
     gboolean loading;
     char *failed_uri;
+    char *retry_uri;
     gboolean exit_sent;
     GHashTable *media_frames;
     gboolean playing_audio;
@@ -720,6 +721,18 @@ static void on_media_message(WebKitUserContentManager *ucm, JSCValue *value, gpo
     media_state_send(v, FALSE);
 }
 
+static void view_retry(KWView *v)
+{
+    char *uri;
+
+    if (!v->retry_uri)
+        return;
+    uri = g_steal_pointer(&v->retry_uri);
+    g_message("view %s: retrying %s", v->profile, uri);
+    webkit_web_view_load_uri(v->web_view, uri);
+    g_free(uri);
+}
+
 static void view_exit(KWView *v)
 {
     if (v->exit_sent || !v->proxy)
@@ -730,7 +743,7 @@ static void view_exit(KWView *v)
     kw_flush();
 }
 
-static void on_exit_message(WebKitUserContentManager *ucm, JSCValue *value, gpointer user_data)
+static void on_kodi_message(WebKitUserContentManager *ucm, JSCValue *value, gpointer user_data)
 {
     char *message;
 
@@ -740,6 +753,8 @@ static void on_exit_message(WebKitUserContentManager *ucm, JSCValue *value, gpoi
     message = jsc_value_to_string(value);
     if (!strcmp(message, "exit"))
         view_exit(user_data);
+    else if (!strcmp(message, "retry"))
+        view_retry(user_data);
     g_free(message);
 }
 
@@ -772,6 +787,8 @@ static void load_committed(KWView *v, const char *uri)
 {
     gboolean error_page = v->failed_uri && !g_strcmp0(uri, v->failed_uri);
 
+    if (error_page)
+        v->retry_uri = g_steal_pointer(&v->failed_uri);
     g_clear_pointer(&v->failed_uri, g_free);
     media_reset(v);
     if (!error_page)
@@ -791,6 +808,7 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
         favicon_stop_poll(v);
         v->favicon_done = FALSE;
         v->loading = TRUE;
+        g_clear_pointer(&v->retry_uri, g_free);
     }
 
     if (event == WEBKIT_LOAD_COMMITTED)
@@ -814,24 +832,62 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
     kw_flush();
 }
 
+static const char ERROR_PAGE_HEAD[] =
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>"
+    "html{height:100%;background:#101418;color:#e8e8e8;font:2.5vw sans-serif}"
+    "body{height:100%;margin:0;display:flex;flex-direction:column;"
+    "align-items:center;justify-content:center;text-align:center}"
+    "p{max-width:80%;margin:0 0 1.5em}"
+    "button{font:inherit;font-size:3em;padding:.1em .7em;color:inherit;"
+    "background:none;border:.08em solid #e8e8e8;border-radius:.3em}"
+    "button:focus{background:#e8e8e8;color:#101418;outline:none}"
+    "</style></head><body><p>";
+
+static const char ERROR_PAGE_TAIL[] =
+    "</p><button autofocus "
+    "onclick=\"window.webkit.messageHandlers.kodi.postMessage('retry')\">"
+    "&#x21bb;</button>"
+    "<script>document.querySelector('button').focus();</script>"
+    "</body></html>";
+
+static void error_page_show(KWView *v, const char *failing_uri, const char *message)
+{
+    char *html;
+    char *text;
+
+    text = g_markup_escape_text(message, -1);
+    html = g_strconcat(ERROR_PAGE_HEAD, text, ERROR_PAGE_TAIL, NULL);
+    g_free(v->failed_uri);
+    v->failed_uri = g_strdup(failing_uri);
+    webkit_web_view_load_alternate_html(v->web_view, html, failing_uri, NULL);
+    g_free(html);
+    g_free(text);
+}
+
 static gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent event,
     const char *failing_uri, GError *error, gpointer user_data)
 {
     KWView *v = user_data;
+    const char *message;
 
     (void)view;
+    (void)event;
     /* a provisional load superseded by a newer navigation */
     if (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED))
         return TRUE;
 
-    if (event == WEBKIT_LOAD_STARTED || event == WEBKIT_LOAD_REDIRECTED) {
-        g_free(v->failed_uri);
-        v->failed_uri = g_strdup(failing_uri);
-    }
-    kodi_web_view_v1_error(v->proxy, KODI_WEB_VIEW_V1_ERROR_CODE_LOAD_FAILED,
-        (error && error->message) ? error->message : "load failed");
+    message = (error && error->message) ? error->message : "load failed";
+    kodi_web_view_v1_error(v->proxy, KODI_WEB_VIEW_V1_ERROR_CODE_LOAD_FAILED, message);
     kw_flush();
-    return FALSE;   /* let the engine show its default error page */
+
+    /* no error page for these, as in the engine's own handler */
+    if (g_error_matches(error, WEBKIT_MEDIA_ERROR, WEBKIT_MEDIA_ERROR_WILL_HANDLE_LOAD) ||
+        g_error_matches(error, WEBKIT_POLICY_ERROR,
+                        WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE))
+        return FALSE;
+
+    error_page_show(v, failing_uri, message);
+    return TRUE;
 }
 
 static gboolean on_load_failed_tls(WebKitWebView *view, const char *failing_uri,
@@ -1610,9 +1666,14 @@ static void view_navigate(void *data, struct kodi_web_view_v1 *proxy, uint32_t a
 
 static void view_set_active(void *data, struct kodi_web_view_v1 *proxy, uint32_t active)
 {
-    (void)proxy;
     KWView *v = data;
+    gboolean shown;
+
+    (void)proxy;
+    shown = active && !v->active;
     v->active = active ? TRUE : FALSE;
+    if (shown)
+        view_retry(v);
     /*
      * An inactive view keeps its page alive (media keeps playing, scripts
      * keep running) with no action needed: WebKit only paints on content
@@ -1690,6 +1751,7 @@ static void view_free(gpointer data)
     g_free(v->current_url);
     g_free(v->pending_url);
     g_free(v->failed_uri);
+    g_free(v->retry_uri);
     g_free(v->profile);
     g_free(v);
 }
@@ -1808,7 +1870,7 @@ static void view_scripts_add(KWView *v)
 {
     WebKitUserScript *script;
 
-    g_signal_connect(v->ucm, "script-message-received::kodi", G_CALLBACK(on_exit_message), v);
+    g_signal_connect(v->ucm, "script-message-received::kodi", G_CALLBACK(on_kodi_message), v);
     g_signal_connect(v->ucm, "script-message-received::kodimedia",
                      G_CALLBACK(on_media_message), v);
     webkit_user_content_manager_register_script_message_handler(v->ucm, "kodi", NULL);
@@ -2072,6 +2134,22 @@ static void on_display_disconnected(WPEDisplay *display, GError *error, gpointer
     _exit(1);
 }
 
+/* an uplink that comes back, or comes back with other addresses, changes routes */
+static void on_network_changed(GNetworkMonitor *monitor, gboolean available, gpointer user_data)
+{
+    GHashTableIter iter;
+    gpointer view;
+
+    (void)monitor;
+    (void)user_data;
+    if (!available || !g_views)
+        return;
+
+    g_hash_table_iter_init(&iter, g_views);
+    while (g_hash_table_iter_next(&iter, NULL, &view))
+        view_retry(view);
+}
+
 static void activate(GApplication *application, gpointer user_data)
 {
     WPEDisplayWayland *wayland;
@@ -2101,6 +2179,8 @@ static void activate(GApplication *application, gpointer user_data)
         return;
     }
     g_views = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, view_free);
+    g_signal_connect(g_network_monitor_get_default(), "network-changed",
+                     G_CALLBACK(on_network_changed), NULL);
     kw_choose_disk_cache();
     filter_store_open();
 
