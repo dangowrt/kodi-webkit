@@ -2168,22 +2168,31 @@ static void kw_route_video_to_kodi(void)
     g_message("video: pages show their video on Kodi's plane at %s", path);
 }
 
-/* The engine binds and loads the CDM named by WPE_WIDEVINE_CDM_PATH. */
+/* The engine binds and loads the CDM named by WPE_WIDEVINE_CDM_PATH. A CDM
+ * the vendor supplies is named apart so that inputstreamhelper leaves it be. */
 static void kw_offer_widevine(void)
 {
+    static const char *const names[] = {
+        "libwidevinecdm-vendor.so", "libwidevinecdm.so"
+    };
     const char *dir = g_getenv("KODI_WEB_CDM_DIR");
-    char *path;
+    char *path = NULL;
+    gsize i;
 
     if (!dir || g_getenv("WPE_WIDEVINE_CDM_PATH"))
         return;
 
-    path = g_build_filename(dir, "libwidevinecdm.so", NULL);
-    if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) {
-        g_setenv("WPE_WIDEVINE_CDM_PATH", path, TRUE);
-        g_message("drm: pages decrypt with %s", path);
-    } else {
-        g_message("drm: no Widevine CDM in %s", dir);
+    for (i = 0; i < G_N_ELEMENTS(names) && !path; i++) {
+        path = g_build_filename(dir, names[i], NULL);
+        if (!g_file_test(path, G_FILE_TEST_IS_REGULAR))
+            g_clear_pointer(&path, g_free);
     }
+    if (!path) {
+        g_message("drm: no Widevine CDM in %s", dir);
+        return;
+    }
+    g_setenv("WPE_WIDEVINE_CDM_PATH", path, TRUE);
+    g_message("drm: pages decrypt with %s", path);
     g_free(path);
 }
 
