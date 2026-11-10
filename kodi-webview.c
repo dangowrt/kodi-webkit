@@ -1311,9 +1311,6 @@ static void list_waiters_resolve(const char *name, const char *id)
 
 static void list_report(const char *name, gboolean prepared)
 {
-    if (wl_proxy_get_version((struct wl_proxy *)g_manager) <
-        KODI_WEB_MANAGER_V1_CONTENT_FILTER_LIST_PREPARED_SINCE_VERSION)
-        return;
     kodi_web_manager_v1_content_filter_list_prepared(g_manager, name, prepared);
     kw_flush();
 }
@@ -2097,7 +2094,7 @@ static void registry_global(void *data, struct wl_registry *registry,
     (void)data;
     if (g_strcmp0(interface, kodi_web_manager_v1_interface.name) == 0 && !g_manager) {
         g_manager = wl_registry_bind(registry, name, &kodi_web_manager_v1_interface,
-                                     MIN(version, 4));
+                                     MIN(version, 1));
         g_manager_name = name;
         kodi_web_manager_v1_add_listener(g_manager, &manager_listener, NULL);
     }
