@@ -10,7 +10,9 @@
  *
  *  sink -> Kodi  HELLO          version
  *  Kodi -> sink  HELLO_REPLY    version, the DRM formats and modifiers Kodi
- *                               can show
+ *                               can show, the frames Kodi keeps while it
+ *                               waits for the next one, and the DMA-BUF heap
+ *                               whose buffers Kodi can show
  *  sink -> Kodi  FRAME          id, size, DRM format and modifier, plane
  *                               layout, colorimetry; carries one descriptor
  *                               (SCM_RIGHTS) per DMA-BUF object
@@ -28,6 +30,7 @@
 #ifndef KODI_WEB_VIDEO_H
 #define KODI_WEB_VIDEO_H
 
+#include <limits.h>
 #include <stdint.h>
 
 #define KODI_WEB_VIDEO_VERSION 1
@@ -87,8 +90,10 @@ struct kodi_web_video_hello_reply
   uint32_t type;
   uint32_t version;
   uint32_t format_count;
-  uint32_t pad;
+  uint32_t held_frames;
   struct kodi_web_video_format formats[KODI_WEB_VIDEO_MAX_FORMATS];
+  /* a node in /dev/dma_heap; empty for none */
+  char dma_heap[NAME_MAX + 1];
 };
 
 struct kodi_web_video_frame

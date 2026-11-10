@@ -24,6 +24,8 @@
 #include "protocol/kodi-web-video.h"
 
 #define PACKAGE "kodi-webkit"
+#define DMA_HEAP_CONTEXT "webkit.dma-heap"
+#define DMA_HEAP_DIR "/dev/dma_heap/"
 
 GST_DEBUG_CATEGORY_STATIC(kodi_video_sink_debug);
 #define GST_CAT_DEFAULT kodi_video_sink_debug
@@ -44,6 +46,8 @@ struct _GstKodiVideoSink {
     GThread *receiver;
     struct kodi_web_video_format formats[KODI_WEB_VIDEO_MAX_FORMATS];
     guint32 format_count;
+    guint32 held_frames;
+    char dma_heap[NAME_MAX + 1];
 
     GMutex lock;
     GHashTable *held;
@@ -155,6 +159,9 @@ static gboolean receive_hello_reply(GstKodiVideoSink *self)
 
     self->format_count = MIN(reply.format_count, KODI_WEB_VIDEO_MAX_FORMATS);
     memcpy(self->formats, reply.formats, sizeof(self->formats));
+    self->held_frames = reply.held_frames;
+    memcpy(self->dma_heap, reply.dma_heap, sizeof(self->dma_heap));
+    self->dma_heap[sizeof(self->dma_heap) - 1] = '\0';
     return self->format_count > 0;
 }
 
@@ -195,6 +202,8 @@ static void connection_close(GstKodiVideoSink *self)
     self->wake_fd = -1;
     self->fd = -1;
     self->format_count = 0;
+    self->held_frames = 0;
+    self->dma_heap[0] = '\0';
 }
 
 static gboolean gst_kodi_video_sink_start(GstBaseSink *bsink)
@@ -219,8 +228,9 @@ static gboolean gst_kodi_video_sink_start(GstBaseSink *bsink)
     self->receiver = g_thread_new("kodivideosink", receiver_run, self);
     if (self->rect.width > 0 && self->rect.height > 0)
         rect_send(self);
-    GST_INFO_OBJECT(self, "connected to %s, %u formats", path,
-        self->format_count);
+    GST_INFO_OBJECT(self, "connected to %s, %u formats, %u frames held, "
+        "dma-heap \"%s\"", path, self->format_count, self->held_frames,
+        self->dma_heap);
     return TRUE;
 }
 
@@ -282,7 +292,36 @@ static gboolean gst_kodi_video_sink_set_caps(GstBaseSink *bsink,
 static gboolean gst_kodi_video_sink_propose_allocation(GstBaseSink *bsink,
     GstQuery *query)
 {
+    GstKodiVideoSink *self = GST_KODI_VIDEO_SINK(bsink);
+
     gst_query_add_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL);
+    if (self->fd >= 0)
+        gst_query_add_allocation_pool(query, NULL, 0, self->held_frames, 0);
+    return TRUE;
+}
+
+static gboolean gst_kodi_video_sink_query(GstBaseSink *bsink, GstQuery *query)
+{
+    GstKodiVideoSink *self = GST_KODI_VIDEO_SINK(bsink);
+    GstStructure *structure;
+    GstContext *context;
+    const char *type;
+    char *device;
+
+    if (GST_QUERY_TYPE(query) != GST_QUERY_CONTEXT ||
+        !gst_query_parse_context_type(query, &type) ||
+        strcmp(type, DMA_HEAP_CONTEXT) || !self->dma_heap[0])
+        return GST_BASE_SINK_CLASS(gst_kodi_video_sink_parent_class)->query(
+            bsink, query);
+
+    device = g_strconcat(DMA_HEAP_DIR, self->dma_heap, NULL);
+    context = gst_context_new(DMA_HEAP_CONTEXT, FALSE);
+    structure = gst_context_writable_structure(context);
+    gst_structure_set(structure, "device", G_TYPE_STRING, device,
+        "held-frames", G_TYPE_UINT, self->held_frames, NULL);
+    gst_query_set_context(query, context);
+    gst_context_unref(context);
+    g_free(device);
     return TRUE;
 }
 
@@ -472,6 +511,7 @@ static void gst_kodi_video_sink_init(GstKodiVideoSink *self)
     g_mutex_init(&self->lock);
     self->held = g_hash_table_new_full(NULL, NULL, NULL,
         (GDestroyNotify)gst_buffer_unref);
+    gst_base_sink_set_last_sample_enabled(GST_BASE_SINK(self), FALSE);
 }
 
 static void gst_kodi_video_sink_class_init(GstKodiVideoSinkClass *klass)
@@ -500,6 +540,7 @@ static void gst_kodi_video_sink_class_init(GstKodiVideoSinkClass *klass)
     bsink_class->propose_allocation =
         GST_DEBUG_FUNCPTR(gst_kodi_video_sink_propose_allocation);
     bsink_class->event = GST_DEBUG_FUNCPTR(gst_kodi_video_sink_event);
+    bsink_class->query = GST_DEBUG_FUNCPTR(gst_kodi_video_sink_query);
     vsink_class->show_frame = GST_DEBUG_FUNCPTR(gst_kodi_video_sink_show_frame);
 }
 
