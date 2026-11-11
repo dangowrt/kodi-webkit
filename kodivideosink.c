@@ -16,6 +16,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <drm/drm_fourcc.h>
 #include <gst/gst.h>
 #include <gst/allocators/gstdmabuf.h>
 #include <gst/video/gstvideosink.h>
@@ -379,6 +380,33 @@ static int object_index(int *fds, guint32 *count, int fd)
     return (*count)++;
 }
 
+static gboolean modifier_is_column(guint64 modifier)
+{
+    switch (fourcc_mod_broadcom_mod(modifier)) {
+    case DRM_FORMAT_MOD_BROADCOM_SAND32:
+    case DRM_FORMAT_MOD_BROADCOM_SAND64:
+    case DRM_FORMAT_MOD_BROADCOM_SAND128:
+    case DRM_FORMAT_MOD_BROADCOM_SAND256:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static guint32 drm_pitch(const GstVideoFormatInfo *finfo, guint64 modifier,
+    guint plane, gint stride)
+{
+    if (!GST_VIDEO_FORMAT_INFO_IS_TILED(finfo))
+        return stride;
+
+    if (modifier_is_column(modifier))
+        return GST_VIDEO_TILE_Y_TILES(stride) *
+            GST_VIDEO_FORMAT_INFO_TILE_HEIGHT(finfo, plane);
+
+    return GST_VIDEO_TILE_X_TILES(stride) *
+        GST_VIDEO_FORMAT_INFO_TILE_STRIDE(finfo, plane);
+}
+
 static gboolean frame_describe(GstKodiVideoSink *self, GstBuffer *buffer,
     struct kodi_web_video_frame *frame, int *fds)
 {
@@ -406,8 +434,8 @@ static gboolean frame_describe(GstKodiVideoSink *self, GstBuffer *buffer,
             return FALSE;
         frame->object[i] = object;
         frame->offset[i] = memory->offset + skip;
-        frame->stride[i] = meta ? meta->stride[i] :
-            GST_VIDEO_INFO_PLANE_STRIDE(info, i);
+        frame->stride[i] = drm_pitch(info->finfo, self->drm_info.drm_modifier,
+            i, meta ? meta->stride[i] : GST_VIDEO_INFO_PLANE_STRIDE(info, i));
     }
     return TRUE;
 }
