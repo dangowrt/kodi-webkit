@@ -59,6 +59,12 @@
 #define KW_PROFILE_MAX 255
 /* data-directory, cache-directory, disk-cache-enabled, uplink */
 #define KW_SESSION_PROPERTIES_MAX 4
+/* 48 dp at 160 dp per inch, a fingertip: a finger laid against the edge starts inside it */
+#define KW_EDGE_ZONE_MM 7.62
+/* Kodi's own swipe distance, SWIPE_MIN_DISTANCE of half an inch */
+#define KW_SWIPE_TRAVEL_MM 12.7
+/* Kodi's own swipe tolerance, SWIPE_MAX_VARIANCE_ANGLE: tan(20 degrees) */
+#define KW_SWIPE_MAX_SLOPE 0.36397023
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                             */
@@ -70,6 +76,7 @@ static struct wl_display *g_wl_display = NULL;
 static struct wl_registry *g_registry = NULL;
 static struct kodi_web_manager_v1 *g_manager = NULL;
 static uint32_t g_manager_name = 0;
+static gboolean g_right_to_left = FALSE;
 static GHashTable *g_views = NULL;   /* profile id (char*, verbatim) -> KWView* */
 static guint g_view_serial = 0;
 
@@ -132,6 +139,14 @@ typedef struct {
     gboolean active;
     gboolean crash_recovering;      /* set on crash, cleared on next load     */
     gboolean reload_started;        /* recovery reload has begun loading      */
+
+    guint touches;                  /* touch points down on the view         */
+    gboolean swipe;                 /* a touch from a side edge is ours       */
+    guint32 swipe_sequence;
+    gboolean swipe_from_left;
+    double swipe_start_x;
+    double swipe_start_y;
+    double swipe_px_per_mm;
 } KWView;
 
 #define KW_MEDIA_VIDEO   (1u << 0)
@@ -1492,6 +1507,98 @@ static void view_set_user_agent(void *data, struct kodi_web_view_v1 *proxy,
     webkit_settings_set_user_agent(v->settings, user_agent);
 }
 
+/* the compositor names no output a surface is on, so its only screen stands in */
+static double view_px_per_mm(WPEView *view)
+{
+    WPEScreen *screen = wpe_view_get_screen(view);
+    int width_mm;
+
+    if (!screen && wpe_display_get_n_screens(g_display) > 0)
+        screen = wpe_display_get_screen(g_display, 0);
+    width_mm = screen ? wpe_screen_get_physical_width(screen) : 0;
+    if (width_mm <= 0)
+        return 0.0;
+    return (double)wpe_screen_get_width(screen) / width_mm;
+}
+
+static gboolean swipe_begin(KWView *v, WPEView *view, WPEEvent *event)
+{
+    double px_per_mm = view_px_per_mm(view);
+    double zone;
+    double x;
+    double y;
+
+    if (px_per_mm <= 0.0 || !wpe_event_get_position(event, &x, &y))
+        return FALSE;
+
+    zone = KW_EDGE_ZONE_MM * px_per_mm;
+    if (x > zone && x < wpe_view_get_width(view) - zone)
+        return FALSE;
+
+    v->swipe = TRUE;
+    v->swipe_sequence = wpe_event_touch_get_sequence_id(event);
+    v->swipe_from_left = x <= zone;
+    v->swipe_start_x = x;
+    v->swipe_start_y = y;
+    v->swipe_px_per_mm = px_per_mm;
+    return TRUE;
+}
+
+/* pages turn back from the edge where the language starts, as in a book */
+static void swipe_end(KWView *v, WPEEvent *event)
+{
+    double inward;
+    double x;
+    double y;
+
+    if (!wpe_event_get_position(event, &x, &y))
+        return;
+
+    inward = v->swipe_from_left ? x - v->swipe_start_x : v->swipe_start_x - x;
+    if (inward < KW_SWIPE_TRAVEL_MM * v->swipe_px_per_mm ||
+        ABS(y - v->swipe_start_y) > inward * KW_SWIPE_MAX_SLOPE)
+        return;
+
+    if (v->swipe_from_left != g_right_to_left) {
+        if (webkit_web_view_can_go_back(v->web_view))
+            webkit_web_view_go_back(v->web_view);
+    } else if (webkit_web_view_can_go_forward(v->web_view)) {
+        webkit_web_view_go_forward(v->web_view);
+    }
+}
+
+/* runs before WebKit's own handler, so the page never sees a touch it returns TRUE for */
+static gboolean on_view_event(WPEView *view, WPEEvent *event, gpointer user_data)
+{
+    WPEEventType type = wpe_event_get_event_type(event);
+    KWView *v = user_data;
+    gboolean ours;
+
+    switch (type) {
+    case WPE_EVENT_TOUCH_DOWN:
+        ours = v->touches == 0 && swipe_begin(v, view, event);
+        v->touches++;
+        return ours;
+    case WPE_EVENT_TOUCH_MOVE:
+        return v->swipe && wpe_event_touch_get_sequence_id(event) == v->swipe_sequence;
+    case WPE_EVENT_TOUCH_UP:
+    case WPE_EVENT_TOUCH_CANCEL:
+        /* wl_touch.cancel ends every touch point at once */
+        if (type == WPE_EVENT_TOUCH_CANCEL)
+            v->touches = 0;
+        else if (v->touches > 0)
+            v->touches--;
+        if (!v->swipe || wpe_event_touch_get_sequence_id(event) != v->swipe_sequence)
+            return FALSE;
+        v->swipe = FALSE;
+        if (type == WPE_EVENT_TOUCH_UP)
+            swipe_end(v, event);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
 static void view_zoom_update(KWView *v)
 {
     WPEView *view = webkit_web_view_get_wpe_view(v->web_view);
@@ -1993,6 +2100,7 @@ static KWView *view_create(const char *profile, const char *uplink, char **why)
                      G_CALLBACK(on_notify_playing_audio), v);
     g_signal_connect(v->web_view, "close", G_CALLBACK(on_close), v);
     g_signal_connect(wpe_view, "resized", G_CALLBACK(on_view_resized), v);
+    g_signal_connect(wpe_view, "event", G_CALLBACK(on_view_event), v);
 
     g_hash_table_insert(g_views, g_strdup(v->profile), v);
     kw_flush();
@@ -2078,10 +2186,19 @@ static void manager_remove_content_filter_list(void *data, struct kodi_web_manag
     g_free(key);
 }
 
+static void manager_layout_direction(void *data, struct kodi_web_manager_v1 *manager,
+    uint32_t direction)
+{
+    (void)data;
+    (void)manager;
+    g_right_to_left = direction == KODI_WEB_MANAGER_V1_LAYOUT_DIRECTION_RIGHT_TO_LEFT;
+}
+
 static const struct kodi_web_manager_v1_listener manager_listener = {
     manager_want_view,
     manager_content_filter_list,
-    manager_remove_content_filter_list
+    manager_remove_content_filter_list,
+    manager_layout_direction
 };
 
 /* ------------------------------------------------------------------ */

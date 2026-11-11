@@ -185,6 +185,24 @@
       <arg name="name" type="string" summary="list identifier"/>
       <arg name="prepared" type="uint" summary="1 if views can apply the list, 0 if not"/>
     </request>
+
+    <enum name="layout_direction">
+      <entry name="left_to_right" value="0" summary="the language is written left to right"/>
+      <entry name="right_to_left" value="1" summary="the language is written right to left"/>
+    </enum>
+
+    <event name="layout_direction">
+      <description summary="the direction of the user's language">
+        The direction in which the language of the user's session is
+        written, independent of any page's content. Pages of a book in that
+        language turn forward in this direction, so a swipe in from the
+        edge where the language starts goes back in a view's history and a
+        swipe in from the other edge goes forward. The compositor sends it
+        after the browser binds the manager and again whenever the
+        language changes.
+      </description>
+      <arg name="direction" type="uint" enum="layout_direction"/>
+    </event>
   </interface>
 
   <interface name="kodi_web_view_v1" version="1">
