@@ -182,9 +182,9 @@ static void kw_flush(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* GStreamer decoder-rank policy (KODI_WEBVIEW_SOFTWARE_CODECS)         */
+/* GStreamer decoder-rank policy                                       */
 /*                                                                     */
-/* With 0 (default) every software VIDEO decoder ranks below the       */
+/* Every software VIDEO decoder ranks below the                        */
 /* hardware decoders of its codec, so the engine prefers hardware and  */
 /* still offers codecs the box can only decode in software. Ranks are  */
 /* process-global, so this is set in this process                      */
@@ -272,13 +272,7 @@ static guint hw_rank_lowest(GHashTable *hw_ranks, GstElementFactory *factory)
 
 static void kw_apply_codec_policy(void)
 {
-    const char *sw = g_getenv("KODI_WEBVIEW_SOFTWARE_CODECS");
     guint hw_rank, rank;
-
-    if (sw && g_strcmp0(sw, "1") == 0) {
-        g_message("codec policy: KODI_WEBVIEW_SOFTWARE_CODECS=1, leaving decoder ranks untouched");
-        return;
-    }
 
     gst_init(NULL, NULL);
     GstRegistry *registry = gst_registry_get();
