@@ -170,6 +170,7 @@ typedef struct {
 static const KWScript kw_scripts[] = {
     /* window.close() of the top document asks Kodi to leave the app */
     { "exit.js", WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, NULL },
+    { "decoding-info.js", WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, NULL },
     /* its own world: pages can neither see nor post to its handler */
     { "media.js", WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, KW_MEDIA_WORLD },
 };
