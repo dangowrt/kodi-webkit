@@ -5,6 +5,7 @@ BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib
 LIBEXECDIR ?= $(PREFIX)/libexec
 GSTPLUGINDIR ?= $(LIBDIR)/gstreamer-1.0
+SCRIPTDIR ?= $(PREFIX)/share/kodi-webkit/scripts
 CFLAGS ?= -O2
 # library the web process preloads to load the Widevine CDM, if any
 WIDEVINE_PRELOAD ?=
@@ -32,6 +33,7 @@ all: kodi-webview kodi-webview-filter libgstkodiaudiosink.so libgstkodivideosink
 kodi-webview: kodi-webview.c protocol/kodi-web-audio.h protocol/kodi-web-video.h $(GENERATED)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPS_CFLAGS) -I. \
 		-DKW_FILTER_HELPER='"$(LIBEXECDIR)/kodi-webview-filter"' \
+		-DKW_SCRIPT_DIR='"$(SCRIPTDIR)"' \
 		$(if $(WIDEVINE_PRELOAD),-DKW_WIDEVINE_PRELOAD='"$(WIDEVINE_PRELOAD)"') \
 		-o $@ kodi-webview.c kodi-web-v1-protocol.c $(LDFLAGS) $(DEPS_LIBS)
 
@@ -56,6 +58,8 @@ install: all
 	install -D -m 0755 kodi-webview-filter $(DESTDIR)$(LIBEXECDIR)/kodi-webview-filter
 	install -D -m 0755 libgstkodiaudiosink.so $(DESTDIR)$(GSTPLUGINDIR)/libgstkodiaudiosink.so
 	install -D -m 0755 libgstkodivideosink.so $(DESTDIR)$(GSTPLUGINDIR)/libgstkodivideosink.so
+	install -d $(DESTDIR)$(SCRIPTDIR)
+	install -m 0644 scripts/*.js $(DESTDIR)$(SCRIPTDIR)/
 
 clean:
 	rm -f kodi-webview kodi-webview-filter libgstkodiaudiosink.so libgstkodivideosink.so $(GENERATED)

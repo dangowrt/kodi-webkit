@@ -159,52 +159,20 @@ typedef struct {
     "*; codecs=\"avc*,x-h264,mp4v*,hvc1*,hev1*,x-h265,vp8*,x-vp8,vp9*,vp09*,x-vp9," \
     "av01*,av1,x-av1,theora\""
 
-/* window.close() of the top document asks Kodi to leave the app */
-static const char EXIT_SCRIPT[] =
-    "(function () {\n"
-    "  var kodi = window.webkit.messageHandlers.kodi;\n"
-    "  window.close = function () { kodi.postMessage('exit'); };\n"
-    "})();\n";
-
 #define KW_MEDIA_WORLD "kodi-media"
 
-/* runs in its own world: pages can neither see nor post to its handler */
-static const char MEDIA_SCRIPT[] =
-    "(function () {\n"
-    "  var post = window.webkit.messageHandlers.kodimedia;\n"
-    "  var token = Math.random().toString(36).slice(2) + Date.now().toString(36);\n"
-    "  var media = new Set();\n"
-    "  var last = -1;\n"
-    "  function bits(m) {\n"
-    "    var s = 0;\n"
-    "    if (m.networkState === m.NETWORK_EMPTY || m.error)\n"
-    "      return 0;\n"
-    "    if (m instanceof HTMLVideoElement && m.videoWidth > 0)\n"
-    "      s |= 1;\n"
-    "    if ((m.audioTracks && m.audioTracks.length) || m.webkitAudioDecodedByteCount > 0)\n"
-    "      s |= 2;\n"
-    "    if (!m.paused && !m.ended)\n"
-    "      s |= 4;\n"
-    "    return s;\n"
-    "  }\n"
-    "  function update(e) {\n"
-    "    var s = 0;\n"
-    "    if (e.target instanceof HTMLMediaElement)\n"
-    "      media.add(e.target);\n"
-    "    media.forEach(function (m) { s |= bits(m); });\n"
-    "    if (s === last)\n"
-    "      return;\n"
-    "    last = s;\n"
-    "    post.postMessage(token + ':' + s);\n"
-    "  }\n"
-    "  ['play', 'playing', 'pause', 'ended', 'emptied', 'error', 'loadedmetadata',\n"
-    "   'loadeddata', 'timeupdate'].forEach(function (t) {\n"
-    "    document.addEventListener(t, update, true);\n"
-    "  });\n"
-    "  window.addEventListener('pagehide', function () {\n"
-    "    post.postMessage(token + ':gone');\n"
-    "  }, true);\n"
-    "})();\n";
+typedef struct {
+    const char *file;
+    WebKitUserContentInjectedFrames frames;
+    const char *world;
+} KWScript;
+
+static const KWScript kw_scripts[] = {
+    /* window.close() of the top document asks Kodi to leave the app */
+    { "exit.js", WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, NULL },
+    /* its own world: pages can neither see nor post to its handler */
+    { "media.js", WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, KW_MEDIA_WORLD },
+};
 
 static void kw_flush(void)
 {
@@ -1970,9 +1938,37 @@ static gboolean view_storage_create(KWView *v, const char *uplink, char **why)
     return v->session != NULL;
 }
 
+static WebKitUserScript *script_load(const KWScript *s)
+{
+    WebKitUserScript *script;
+    GError *error = NULL;
+    char *source;
+    char *path;
+
+    path = g_build_filename(KW_SCRIPT_DIR, s->file, NULL);
+    if (!g_file_get_contents(path, &source, NULL, &error)) {
+        g_warning("user script %s: %s", path, error->message);
+        g_error_free(error);
+        g_free(path);
+        return NULL;
+    }
+
+    if (s->world)
+        script = webkit_user_script_new_for_world(source, s->frames,
+                                                  WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+                                                  s->world, NULL, NULL);
+    else
+        script = webkit_user_script_new(source, s->frames,
+                                        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    g_free(source);
+    g_free(path);
+    return script;
+}
+
 static void view_scripts_add(KWView *v)
 {
     WebKitUserScript *script;
+    gsize i;
 
     g_signal_connect(v->ucm, "script-message-received::kodi", G_CALLBACK(on_kodi_message), v);
     g_signal_connect(v->ucm, "script-message-received::kodimedia",
@@ -1981,16 +1977,13 @@ static void view_scripts_add(KWView *v)
     webkit_user_content_manager_register_script_message_handler(v->ucm, "kodimedia",
                                                                 KW_MEDIA_WORLD);
 
-    script = webkit_user_script_new(EXIT_SCRIPT, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
-                                    WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
-    webkit_user_content_manager_add_script(v->ucm, script);
-    webkit_user_script_unref(script);
-
-    script = webkit_user_script_new_for_world(MEDIA_SCRIPT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-                                              WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
-                                              KW_MEDIA_WORLD, NULL, NULL);
-    webkit_user_content_manager_add_script(v->ucm, script);
-    webkit_user_script_unref(script);
+    for (i = 0; i < G_N_ELEMENTS(kw_scripts); i++) {
+        script = script_load(&kw_scripts[i]);
+        if (!script)
+            continue;
+        webkit_user_content_manager_add_script(v->ucm, script);
+        webkit_user_script_unref(script);
+    }
 }
 
 /*
